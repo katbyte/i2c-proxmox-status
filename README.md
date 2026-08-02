@@ -10,7 +10,8 @@ SKU RM0004). The original C and Python sources remain in git history.
 Cycles the front-panel LCD through four status screens — CPU load, RAM usage,
 SoC temperature, and disk usage — one every two seconds. A header line shows
 `ip - hostname.fqdn`, scrolling as a slow marquee when it's too wide for the
-display. Stats are read locally from `/proc`, sysfs, and statvfs(2).
+display. Stats come from the [sysinfo](https://crates.io/crates/sysinfo)
+crate.
 
 The end goal is to show Proxmox host stats pulled from the Proxmox API
 instead of local readings; that part isn't built yet.
@@ -50,30 +51,40 @@ Two quirks the driver has to honor:
 - **Pacing** — the MCU needs breathing room: ~10µs after each 3-byte
   transaction, and burst writes chunked to 160 bytes with ~700µs between
   chunks.
+- **Session size** — a single burst session longer than ~5KB (16 full-width
+  rows) overruns the bridge and the content lands displaced on the panel,
+  so tall blits are split into 16-row windows.
 
-Single-pixel writes are slow (one I2C transaction each), so rectangle fills
-use burst mode: enable register `0x01`, stream raw pixel bytes in 160-byte
-chunks, disable, sync. Text rendering uses pixel-at-a-time writes, which is
-why the screens only repaint the regions that change.
+Single-pixel writes (register `0x00`) cost one I2C transaction per pixel,
+so this daemon never uses them: everything goes through burst mode — enable
+register `0x01`, stream raw pixel bytes in 160-byte chunks, disable, sync.
 
-### Fonts
+### Framebuffer and differential flushing
 
-`src/fonts.rs` holds four bitmap fonts (7x10, 8x16, 11x18, 16x26), generated
-from the original repo's `fonts.c`. Each font covers ASCII 32–126; a glyph is
-`height` u16 values, one per row, with bit 15 as the leftmost pixel. Drawing
-a character sets a glyph-sized address window and streams foreground or
-background color per bit.
+The I2C bus is the bottleneck: ~40 KB/s at 400kHz means a full-screen push
+(25.6 KB) takes ~0.8s, and a 160x16 header band ~140ms — about 7fps at best.
+So nothing draws to the display directly. Each frame is composed into an
+in-memory framebuffer (`src/framebuffer.rs`), which implements
+[embedded-graphics](https://crates.io/crates/embedded-graphics)'
+`DrawTarget`, so text, rectangles, and the rest of its primitives all render
+into RAM for free. `flush()` then diffs the frame against a copy of what the
+display currently shows and pushes only the changed rows (contiguous dirty
+rows as one full-width burst blit each — the bridge MCU misbehaves with
+narrow windows at arbitrary offsets, so bands are never column-trimmed).
+
+Fonts come from embedded-graphics' built-in monospace set (9x15 for the
+header, 10x20 for the values) — the bitmap fonts hand-ported from the C repo
+are gone.
 
 ### Screens
 
-`src/screens.rs` implements the header and the rotation. The static
-background (black fill plus the blue divider bar) is painted once at
-startup; after that the header and each screen repaint only their own
-regions, so the display never visibly wipes. The header marquee is
-rasterized into an offscreen buffer and blitted in one burst per scroll
-step; each stat screen repaints its value line and gauge. The gauge is ten
-6x10 segments at the bottom, filled proportionally to the percentage in a
-per-screen color (green/yellow/red/blue), gray for the remainder.
+`src/screens.rs` implements the header and the rotation. The header marquee
+scrolls 1px per frame whenever `ip - hostname.fqdn` is wider than the
+display; the stat screens redraw their value line and gauge into the
+framebuffer, and the diff flush works out what actually needs to hit the
+bus. The gauge is ten 6x10 segments at the bottom, filled proportionally to
+the percentage in a per-screen color (green/yellow/red/blue), gray for the
+remainder.
 
 ## Build and run
 
@@ -94,8 +105,8 @@ sudo ./target/release/i2c-proxmox-status   # sudo unless your user is in the i2c
 
 ## Layout
 
-- `src/st7735.rs` — display driver (the bridge's I2C register protocol)
-- `src/fonts.rs` — bitmap fonts, generated from the original C `fonts.c`
-- `src/stats.rs` — stat collection (`/proc`, sysfs, statvfs)
-- `src/screens.rs` — `Screen` trait and the four status screens
-- `src/main.rs` — the display loop
+- `src/st7735.rs` — display transport (the bridge's I2C register protocol)
+- `src/framebuffer.rs` — embedded-graphics `DrawTarget` + differential flush
+- `src/stats.rs` — stat collection (sysinfo crate) and IP/FQDN helpers
+- `src/screens.rs` — header marquee, `Screen` trait, the four status screens
+- `src/main.rs` — the compose/flush loop

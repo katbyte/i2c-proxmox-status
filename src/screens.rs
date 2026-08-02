@@ -1,180 +1,148 @@
-//! The header marquee and the rotating status screens.
-//!
-//! The static background (black fill + blue divider bar) is painted once at
-//! startup by main; the header and each screen only ever repaint their own
-//! region, so the display never visibly wipes.
-//!
-//! Everything is rasterized into offscreen RGB565 buffers and pushed with
-//! burst-mode blits: the I2C bus (~40 KB/s at 400kHz) is the bottleneck, and
-//! per-pixel writes are an order of magnitude slower than bursts.
+//! The header marquee and the rotating status screens, drawn with
+//! embedded-graphics primitives into the framebuffer. Nothing here touches
+//! the display — main flushes the framebuffer after composing a frame.
 
-use std::io;
+use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_9X15};
+use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
+use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use embedded_graphics::text::{Baseline, Text};
 
-use crate::fonts::{Font, FONT_11X18, FONT_8X16};
-use crate::st7735::{self, Lcd};
-use crate::stats;
+use crate::framebuffer::FrameBuffer;
+use crate::st7735::WIDTH;
+use crate::stats::Stats;
+
+const GRAY: Rgb565 = Rgb565::new(16, 32, 16); // the C code's 0x8410
 
 pub trait Screen {
-    fn render(&mut self, lcd: &mut Lcd) -> io::Result<()>;
+    fn render(&mut self, fb: &mut FrameBuffer, stats: &mut Stats);
 }
 
-/// Draw `text` into an offscreen buffer at pixel offset x, clipping at the
-/// buffer's right edge.
-fn draw_text(buf: &mut [u16], buf_w: usize, x: usize, text: &str, font: &Font, color: u16) {
-    let fw = font.width as usize;
-    for (i, ch) in text.chars().enumerate() {
-        let x0 = x + i * fw;
-        if x0 + fw > buf_w {
-            break;
-        }
-        for (row, &bits) in font.glyph(ch).iter().enumerate() {
-            for bit in 0..fw {
-                if (bits << bit) & 0x8000 != 0 {
-                    buf[row * buf_w + x0 + bit] = color;
-                }
-            }
-        }
-    }
+fn text_width(font: &MonoFont, text: &str) -> i32 {
+    let advance = font.character_size.width + font.character_spacing;
+    (text.chars().count() as u32 * advance) as i32
+}
+
+/// Fill a band of the framebuffer with black.
+fn clear_band(fb: &mut FrameBuffer, y: i32, h: u32) {
+    Rectangle::new(Point::new(0, y), Size::new(WIDTH as u32, h))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(fb)
+        .unwrap();
 }
 
 /// Top-of-screen "ip - hostname.fqdn" line. Text wider than the display
-/// scrolls as a marquee; shorter text is drawn once and left alone.
-/// One frame is a ~5KB blit (~140ms on the bus), so ~7fps is the ceiling —
-/// scroll in 1px steps to look as smooth as the bus allows.
+/// scrolls as a marquee, advancing 1px per frame; shorter text sits still.
 pub struct Header {
-    text: Vec<char>,
-    offset: usize,
-    dirty: bool,
+    text: String,
+    offset: i32,
+    span: i32, // marquee period: text width plus the gap between repeats
 }
 
-const HEADER_HEIGHT: u16 = 16; // FONT_8X16
-const SCROLL_GAP_PX: usize = 24; // blank run between marquee repeats
-const SCROLL_STEP_PX: usize = 1;
+const HEADER_FONT: &MonoFont = &FONT_9X15;
+const SCROLL_GAP_PX: i32 = 24;
 
 impl Header {
     pub fn new(text: &str) -> Self {
-        Self { text: text.chars().collect(), offset: 0, dirty: true }
-    }
-
-    fn pixel_width(&self) -> usize {
-        self.text.len() * FONT_8X16.width as usize
+        let span = text_width(HEADER_FONT, text) + SCROLL_GAP_PX;
+        Self { text: text.to_string(), offset: 0, span }
     }
 
     fn scrolling(&self) -> bool {
-        self.pixel_width() > st7735::WIDTH as usize
+        text_width(HEADER_FONT, &self.text) > WIDTH as i32
     }
 
-    /// Advance the marquee one step and repaint if anything moved.
-    pub fn tick(&mut self, lcd: &mut Lcd) -> io::Result<()> {
+    /// Draw the current marquee position and advance one step.
+    pub fn draw(&mut self, fb: &mut FrameBuffer) {
+        clear_band(fb, 0, HEADER_FONT.character_size.height);
+        let style = MonoTextStyle::new(HEADER_FONT, Rgb565::WHITE);
+        let mut draw_at = |x: i32| {
+            Text::with_baseline(&self.text, Point::new(x, 0), style, Baseline::Top)
+                .draw(fb)
+                .unwrap();
+        };
         if self.scrolling() {
-            self.offset = (self.offset + SCROLL_STEP_PX) % (self.pixel_width() + SCROLL_GAP_PX);
-            self.dirty = true;
+            // Two copies, one span apart; the framebuffer clips off-screen
+            // pixels, so we don't care which parts land outside.
+            draw_at(-self.offset);
+            draw_at(-self.offset + self.span);
+            self.offset = (self.offset + 1) % self.span;
+        } else {
+            draw_at(0);
         }
-        self.render(lcd)
-    }
-
-    /// Rasterize the visible slice of the text and blit it in one burst.
-    pub fn render(&mut self, lcd: &mut Lcd) -> io::Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        let font = &FONT_8X16;
-        let font_width = font.width as usize;
-        let (w, h) = (st7735::WIDTH as usize, font.height as usize);
-        let span = self.pixel_width() + SCROLL_GAP_PX;
-
-        let mut buf = vec![st7735::BLACK; w * h];
-        for col in 0..w {
-            let src = if self.scrolling() { (self.offset + col) % span } else { col };
-            if src >= self.pixel_width() {
-                continue; // in the gap between marquee repeats / past short text
-            }
-            let rows = font.glyph(self.text[src / font_width]);
-            let bit = src % font_width;
-            for (row, &bits) in rows.iter().enumerate() {
-                if (bits << bit) & 0x8000 != 0 {
-                    buf[row * w + col] = st7735::WHITE;
-                }
-            }
-        }
-        lcd.blit(0, 0, st7735::WIDTH, HEADER_HEIGHT, &buf)?;
-        self.dirty = false;
-        Ok(())
     }
 }
 
-/// "LABEL: <value><unit>" in the large font, blitted as one band.
-fn draw_value_line(lcd: &mut Lcd, label: &str, x: u16, value: u8, unit: &str) -> io::Result<()> {
-    let (w, h) = (st7735::WIDTH as usize, FONT_11X18.height as usize);
-    let mut buf = vec![st7735::BLACK; w * h];
-    let text = format!("{label}{value}{unit}");
-    draw_text(&mut buf, w, x as usize, &text, &FONT_11X18, st7735::WHITE);
-    lcd.blit(0, 35, st7735::WIDTH, FONT_11X18.height, &buf)
+/// The stat line in the large font, on fixed columns so nothing shifts
+/// between screens: label left-aligned at 30, value right-aligned against
+/// the unit, unit fixed at 115.
+fn draw_value_line(fb: &mut FrameBuffer, label: &str, value: u8, unit: &str) {
+    const FONT: &MonoFont = &FONT_10X20;
+    const LABEL_X: i32 = 30;
+    const UNIT_X: i32 = 115;
+
+    clear_band(fb, 35, FONT.character_size.height);
+    let style = MonoTextStyle::new(FONT, Rgb565::WHITE);
+    let mut draw_at = |text: &str, x: i32| {
+        Text::with_baseline(text, Point::new(x, 35), style, Baseline::Top)
+            .draw(fb)
+            .unwrap();
+    };
+    let value = value.to_string();
+    draw_at(label, LABEL_X);
+    draw_at(&value, UNIT_X - text_width(FONT, &value));
+    draw_at(unit, UNIT_X);
 }
 
-/// Ten-segment bar gauge, blitted as one 100x10 band at (30, 60).
-fn draw_gauge(lcd: &mut Lcd, percent: u8, color: u16) -> io::Result<()> {
-    const SEG_W: usize = 6;
-    const SEG_PITCH: usize = 10;
-    const BAND_W: usize = 10 * SEG_PITCH;
-    const BAND_H: usize = 10;
-
-    let filled = ((percent.min(100) as usize + 10).min(100)) / 10;
-    let mut buf = vec![st7735::BLACK; BAND_W * BAND_H];
+/// Ten-segment bar gauge along the bottom of the display.
+fn draw_gauge(fb: &mut FrameBuffer, percent: u8, color: Rgb565) {
+    let filled = (percent.min(100) as i32 + 10).min(100) / 10;
     for segment in 0..10 {
-        let segment_color = if segment < filled { color } else { st7735::GRAY };
-        for row in 0..BAND_H {
-            let start = row * BAND_W + segment * SEG_PITCH;
-            buf[start..start + SEG_W].fill(segment_color);
-        }
-    }
-    lcd.blit(30, 60, BAND_W as u16, BAND_H as u16, &buf)
-}
-
-pub struct CpuScreen {
-    sampler: stats::CpuSampler,
-}
-
-impl CpuScreen {
-    pub fn new() -> Self {
-        Self { sampler: stats::CpuSampler::new() }
+        let segment_color = if segment < filled { color } else { GRAY };
+        Rectangle::new(Point::new(30 + segment * 10, 60), Size::new(6, 10))
+            .into_styled(PrimitiveStyle::with_fill(segment_color))
+            .draw(fb)
+            .unwrap();
     }
 }
+
+pub struct CpuScreen;
 
 impl Screen for CpuScreen {
-    fn render(&mut self, lcd: &mut Lcd) -> io::Result<()> {
-        let cpu = self.sampler.percent()?;
-        draw_value_line(lcd, "CPU:", 36, cpu, "%")?;
-        draw_gauge(lcd, cpu, st7735::GREEN)
+    fn render(&mut self, fb: &mut FrameBuffer, stats: &mut Stats) {
+        let cpu = stats.cpu_percent();
+        draw_value_line(fb, "CPU:", cpu, "%");
+        draw_gauge(fb, cpu, Rgb565::GREEN);
     }
 }
 
 pub struct RamScreen;
 
 impl Screen for RamScreen {
-    fn render(&mut self, lcd: &mut Lcd) -> io::Result<()> {
-        let ram = stats::memory_percent()?;
-        draw_value_line(lcd, "RAM:", 36, ram, "%")?;
-        draw_gauge(lcd, ram, st7735::YELLOW)
+    fn render(&mut self, fb: &mut FrameBuffer, stats: &mut Stats) {
+        let ram = stats.memory_percent();
+        draw_value_line(fb, "RAM:", ram, "%");
+        draw_gauge(fb, ram, Rgb565::YELLOW);
     }
 }
 
 pub struct TempScreen;
 
 impl Screen for TempScreen {
-    fn render(&mut self, lcd: &mut Lcd) -> io::Result<()> {
-        let temp = stats::temperature_celsius()?;
-        draw_value_line(lcd, "TEMP:", 30, temp, "C")?;
-        draw_gauge(lcd, temp, st7735::RED)
+    fn render(&mut self, fb: &mut FrameBuffer, stats: &mut Stats) {
+        let temp = stats.temperature_celsius();
+        draw_value_line(fb, "TEMP:", temp, "C");
+        draw_gauge(fb, temp, Rgb565::RED);
     }
 }
 
 pub struct DiskScreen;
 
 impl Screen for DiskScreen {
-    fn render(&mut self, lcd: &mut Lcd) -> io::Result<()> {
-        let disk = stats::disk_percent()?;
-        draw_value_line(lcd, "DISK:", 30, disk, "%")?;
-        draw_gauge(lcd, disk, st7735::BLUE)
+    fn render(&mut self, fb: &mut FrameBuffer, stats: &mut Stats) {
+        let disk = stats.disk_percent();
+        draw_value_line(fb, "DISK:", disk, "%");
+        draw_gauge(fb, disk, Rgb565::BLUE);
     }
 }

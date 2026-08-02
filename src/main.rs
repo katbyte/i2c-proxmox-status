@@ -1,9 +1,10 @@
 //! Status display daemon for the UCTRONICS rack-mount LCD.
 //!
-//! Paints the static background once, then cycles the four status screens
-//! (one every two seconds) while the header marquee scrolls continuously.
+//! Composes each frame in an in-memory framebuffer (header marquee, divider,
+//! current stat screen), then differentially flushes it: only regions that
+//! changed since the last flush are pushed over the slow I2C bus.
 
-mod fonts;
+mod framebuffer;
 mod screens;
 mod st7735;
 mod stats;
@@ -12,13 +13,18 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+
+use framebuffer::FrameBuffer;
 use screens::{CpuScreen, DiskScreen, Header, RamScreen, Screen, TempScreen};
 use st7735::Lcd;
 
 const SCREEN_HOLD: Duration = Duration::from_secs(2);
-// The header blit itself takes ~140ms on the I2C bus; this small pause just
-// keeps the loop from spinning when the header isn't scrolling.
-const HEADER_TICK: Duration = Duration::from_millis(15);
+// Breather between frames; the marquee flush itself (~140ms on the bus) sets
+// the real pace.
+const FRAME_PAUSE: Duration = Duration::from_millis(20);
 
 fn main() -> ExitCode {
     let mut lcd = match Lcd::open() {
@@ -30,21 +36,18 @@ fn main() -> ExitCode {
     };
     thread::sleep(Duration::from_secs(1));
 
-    let mut header = Header::new(&format!("{} - {}", stats::ip_address(), stats::fqdn()));
+    let mut fb = FrameBuffer::new();
+    // The blue divider bar under the header; drawn once, never overdrawn.
+    Rectangle::new(Point::new(0, 20), Size::new(st7735::WIDTH as u32, 5))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+        .draw(&mut fb)
+        .unwrap();
 
-    // Static background: black everywhere, blue divider under the header.
-    // Screens and header only repaint their own regions after this.
-    if let Err(e) = lcd
-        .fill_screen(st7735::BLACK)
-        .and_then(|_| lcd.fill_rectangle(0, 20, st7735::WIDTH, 5, st7735::BLUE))
-        .and_then(|_| header.render(&mut lcd))
-    {
-        eprintln!("failed to draw the background: {e}");
-        return ExitCode::FAILURE;
-    }
+    let mut header = Header::new(&format!("{} - {}", stats::ip_address(), stats::fqdn()));
+    let mut stats = stats::Stats::new();
 
     let mut screens: [Box<dyn Screen>; 4] = [
-        Box::new(CpuScreen::new()),
+        Box::new(CpuScreen),
         Box::new(RamScreen),
         Box::new(TempScreen),
         Box::new(DiskScreen),
@@ -52,15 +55,17 @@ fn main() -> ExitCode {
 
     loop {
         for screen in &mut screens {
-            if let Err(e) = screen.render(&mut lcd) {
-                eprintln!("render failed: {e}");
-            }
+            screen.render(&mut fb, &mut stats);
             let deadline = Instant::now() + SCREEN_HOLD;
-            while Instant::now() < deadline {
-                if let Err(e) = header.tick(&mut lcd) {
-                    eprintln!("header render failed: {e}");
+            loop {
+                header.draw(&mut fb);
+                if let Err(e) = fb.flush(&mut lcd) {
+                    eprintln!("flush failed: {e}");
                 }
-                thread::sleep(HEADER_TICK);
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(FRAME_PAUSE);
             }
         }
     }

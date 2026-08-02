@@ -1,109 +1,79 @@
-//! Local host stats, ported from `hardware/rpiInfo/rpiInfo.c`.
+//! Local host stats via the `sysinfo` crate, plus IP/hostname helpers.
 //!
-//! The C version shelled out to `top` and `df`; here CPU and memory come
-//! straight from /proc, and disk usage from statvfs(2). This module is the
-//! piece that will eventually be swapped for the Proxmox API client.
+//! One `Stats` instance is shared by all screens: sysinfo computes CPU usage
+//! as the delta since the previous refresh, so the state has to persist
+//! across renders. This module is the piece that will eventually be joined
+//! by the Proxmox API client.
 
 use std::fs;
-use std::io;
 use std::net::UdpSocket;
-use std::thread;
-use std::time::Duration;
 
-/// CPU usage from /proc/stat deltas. Keeps the previous sample between
-/// calls, so each reading covers the interval since the last one and never
-/// has to sleep mid-render (which would stall the display).
-pub struct CpuSampler {
-    last: Option<(u64, u64)>, // (total, idle) jiffies
+use sysinfo::{Components, Disks, MemoryRefreshKind, System};
+
+pub struct Stats {
+    system: System,
+    components: Components,
+    disks: Disks,
 }
 
-impl CpuSampler {
+impl Stats {
     pub fn new() -> Self {
-        Self { last: None }
-    }
-
-    pub fn percent(&mut self) -> io::Result<u8> {
-        let mut current = Self::sample()?;
-        let last = match self.last {
-            Some(last) => last,
-            None => {
-                // First reading: no history yet, take a short window.
-                let first = current;
-                thread::sleep(Duration::from_millis(100));
-                current = Self::sample()?;
-                first
-            }
-        };
-        self.last = Some(current);
-
-        let total = current.0.saturating_sub(last.0);
-        let idle = current.1.saturating_sub(last.1);
-        if total == 0 {
-            return Ok(0);
+        let mut system = System::new();
+        // Seed the CPU counters so the first real reading has a baseline.
+        system.refresh_cpu_usage();
+        Self {
+            system,
+            components: Components::new_with_refreshed_list(),
+            disks: Disks::new_with_refreshed_list(),
         }
-        Ok((100 * (total - idle) / total) as u8)
     }
 
-    fn sample() -> io::Result<(u64, u64)> {
-        let stat = fs::read_to_string("/proc/stat")?;
-        let line = stat
-            .lines()
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "/proc/stat is empty"))?;
-        // "cpu  user nice system idle iowait irq softirq steal ..."
-        let fields: Vec<u64> = line
-            .split_whitespace()
-            .skip(1)
-            .filter_map(|f| f.parse().ok())
-            .collect();
-        let total: u64 = fields.iter().sum();
-        let idle = fields.get(3).copied().unwrap_or(0) + fields.get(4).copied().unwrap_or(0);
-        Ok((total, idle))
+    /// CPU usage since the previous call, across all cores.
+    pub fn cpu_percent(&mut self) -> u8 {
+        self.system.refresh_cpu_usage();
+        self.system.global_cpu_usage().round() as u8
     }
-}
 
-/// Memory usage percentage from /proc/meminfo, matching the C version's
-/// (MemTotal - MemFree) / MemTotal calculation.
-pub fn memory_percent() -> io::Result<u8> {
-    let meminfo = fs::read_to_string("/proc/meminfo")?;
-    let field = |name: &str| -> Option<u64> {
-        meminfo
-            .lines()
-            .find(|l| l.starts_with(name))?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()
-    };
-    let total = field("MemTotal:")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "MemTotal not found"))?;
-    let free = field("MemFree:").unwrap_or(0);
-    Ok((100 * (total - free) / total) as u8)
-}
-
-/// SoC temperature in whole degrees Celsius.
-pub fn temperature_celsius() -> io::Result<u8> {
-    let raw = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")?;
-    let millidegrees: i64 = raw
-        .trim()
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok((millidegrees / 1000).clamp(0, u8::MAX as i64) as u8)
-}
-
-/// Root filesystem usage percentage via statvfs(2).
-pub fn disk_percent() -> io::Result<u8> {
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c"/".as_ptr(), &mut stat) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+    /// Used memory as sysinfo reports it (total minus available).
+    pub fn memory_percent(&mut self) -> u8 {
+        self.system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        let total = self.system.total_memory();
+        if total == 0 {
+            return 0;
+        }
+        (self.system.used_memory() * 100 / total) as u8
     }
-    let total = stat.f_blocks as u64;
-    let free = stat.f_bfree as u64;
-    if total == 0 {
-        return Ok(0);
+
+    /// SoC temperature in whole degrees Celsius: the CPU thermal component,
+    /// or the first component that reports anything.
+    pub fn temperature_celsius(&mut self) -> u8 {
+        self.components.refresh(true);
+        let cpu_first = |c: &&sysinfo::Component| c.label().to_lowercase().contains("cpu");
+        self.components
+            .iter()
+            .find(cpu_first)
+            .or_else(|| self.components.iter().next())
+            .and_then(|c| c.temperature())
+            .map(|t| t.round().clamp(0.0, 255.0) as u8)
+            .unwrap_or(0)
     }
-    Ok((100 * (total - free) / total) as u8)
+
+    /// Root filesystem usage percentage.
+    pub fn disk_percent(&mut self) -> u8 {
+        self.disks.refresh(true);
+        let Some(root) = self
+            .disks
+            .iter()
+            .find(|d| d.mount_point() == std::path::Path::new("/"))
+        else {
+            return 0;
+        };
+        let total = root.total_space();
+        if total == 0 {
+            return 0;
+        }
+        ((total - root.available_space()) * 100 / total) as u8
+    }
 }
 
 /// Fully qualified hostname: the kernel hostname, extended to an FQDN via
@@ -138,4 +108,23 @@ pub fn ip_address() -> String {
         })
         .map(|a| a.ip().to_string());
     addr.unwrap_or_else(|_| "xxx.xxx.xxx.xxx".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_smoke() {
+        let mut stats = Stats::new();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let cpu = stats.cpu_percent();
+        let mem = stats.memory_percent();
+        let disk = stats.disk_percent();
+        let temp = stats.temperature_celsius();
+        println!("cpu={cpu}% mem={mem}% disk={disk}% temp={temp}C ip={} fqdn={}", ip_address(), fqdn());
+        assert!(cpu <= 100);
+        assert!((1..=100).contains(&mem));
+        assert!(disk <= 100);
+    }
 }

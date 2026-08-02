@@ -1,21 +1,18 @@
 //! Driver for the UCTRONICS SKU_RM0004 front panel: an ST7735 160x80 LCD
 //! sitting behind an RP2040 that bridges I2C (address 0x18) to the panel.
 //!
-//! Ported from `hardware/st7735/st7735.c`. The register protocol is specific
-//! to this board's bridge firmware, not the raw ST7735 command set: every
-//! transaction is `[register, high_byte, low_byte]`, plus a burst mode for
-//! bulk pixel pushes.
-
-// The full API of the C driver is kept, even the parts no screen uses yet.
-#![allow(dead_code)]
+//! Ported from `hardware/st7735/st7735.c` (see git history). The register
+//! protocol is specific to this board's bridge firmware, not the raw ST7735
+//! command set: every transaction is `[register, high_byte, low_byte]`, plus
+//! a burst mode for bulk pixel pushes.
+//!
+//! All drawing happens in `FrameBuffer`; this module is just the transport.
 
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::thread;
 use std::time::Duration;
-
-use crate::fonts::Font;
 
 pub const WIDTH: u16 = 160;
 pub const HEIGHT: u16 = 80;
@@ -32,26 +29,10 @@ const I2C_SLAVE_FORCE: libc::c_ulong = 0x0706;
 const X_COORDINATE_REG: u8 = 0x2A;
 const Y_COORDINATE_REG: u8 = 0x2B;
 const CHAR_DATA_REG: u8 = 0x2C;
-const WRITE_DATA_REG: u8 = 0x00;
 const BURST_WRITE_REG: u8 = 0x01;
 const SYNC_REG: u8 = 0x03;
 
 const BURST_MAX_LENGTH: usize = 160;
-
-// RGB565 colors.
-pub const BLACK: u16 = 0x0000;
-pub const BLUE: u16 = 0x001F;
-pub const RED: u16 = 0xF800;
-pub const GREEN: u16 = 0x07E0;
-pub const CYAN: u16 = 0x07FF;
-pub const MAGENTA: u16 = 0xF81F;
-pub const YELLOW: u16 = 0xFFE0;
-pub const WHITE: u16 = 0xFFFF;
-pub const GRAY: u16 = 0x8410;
-
-pub const fn color565(r: u8, g: u8, b: u8) -> u16 {
-    ((r as u16 & 0xF8) << 8) | ((g as u16 & 0xFC) << 3) | ((b as u16 & 0xF8) >> 3)
-}
 
 pub struct Lcd {
     i2c: File,
@@ -74,10 +55,6 @@ impl Lcd {
         Ok(())
     }
 
-    fn write_data(&mut self, high: u8, low: u8) -> io::Result<()> {
-        self.write_command(WRITE_DATA_REG, high, low)
-    }
-
     /// Push a pixel buffer through the bridge's burst mode, chunked to its
     /// 160-byte limit with the settle delay the firmware needs between chunks.
     fn burst_transfer(&mut self, data: &[u8]) -> io::Result<()> {
@@ -97,89 +74,31 @@ impl Lcd {
         self.write_command(SYNC_REG, 0x00, 0x01)
     }
 
-    pub fn write_char(
-        &mut self,
-        x: u16,
-        y: u16,
-        ch: char,
-        font: &Font,
-        color: u16,
-        bgcolor: u16,
-    ) -> io::Result<()> {
-        self.set_address_window(
-            x as u8,
-            y as u8,
-            (x + font.width - 1) as u8,
-            (y + font.height - 1) as u8,
-        )?;
-        for &row in font.glyph(ch) {
-            for bit in 0..font.width {
-                let pixel = if (row << bit) & 0x8000 != 0 { color } else { bgcolor };
-                self.write_data((pixel >> 8) as u8, (pixel & 0xFF) as u8)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Draw a string, wrapping at the right edge and stopping at the bottom.
-    pub fn write_string(
-        &mut self,
-        x: u16,
-        y: u16,
-        text: &str,
-        font: &Font,
-        color: u16,
-        bgcolor: u16,
-    ) -> io::Result<()> {
-        let (mut x, mut y) = (x, y);
-        for ch in text.chars() {
-            if x + font.width >= WIDTH {
-                x = 0;
-                y += font.height;
-                if y + font.height >= HEIGHT {
-                    break;
-                }
-                if ch == ' ' {
-                    continue; // skip spaces at the start of a wrapped line
-                }
-            }
-            self.write_char(x, y, ch, font, color, bgcolor)?;
-            self.write_command(SYNC_REG, 0x00, 0x01)?;
-            x += font.width;
-        }
-        Ok(())
-    }
-
-    pub fn fill_rectangle(&mut self, x: u16, y: u16, w: u16, h: u16, color: u16) -> io::Result<()> {
-        if x >= WIDTH || y >= HEIGHT {
-            return Ok(());
-        }
-        let w = w.min(WIDTH - x);
-        let h = h.min(HEIGHT - y);
-        self.set_address_window(x as u8, y as u8, (x + w - 1) as u8, (y + h - 1) as u8)?;
-
-        let row: Vec<u8> = (0..w)
-            .flat_map(|_| [(color >> 8) as u8, (color & 0xFF) as u8])
-            .collect();
-        for _ in 0..h {
-            self.burst_transfer(&row)?;
-        }
-        Ok(())
-    }
-
-    pub fn fill_screen(&mut self, color: u16) -> io::Result<()> {
-        self.fill_rectangle(0, 0, WIDTH, HEIGHT, color)?;
-        self.write_command(SYNC_REG, 0x00, 0x01)
-    }
-
-    /// Draw a w*h block of RGB565 pixels at (x, y) in one burst — much faster
-    /// than per-pixel writes for anything bigger than a glyph.
+    /// Draw a w*h block of RGB565 pixels at (x, y).
+    ///
+    /// Split into windows of at most MAX_SESSION_BYTES each: longer burst
+    /// sessions overrun the bridge firmware and the content lands displaced
+    /// on the panel. 16 full-width rows is the largest session verified on
+    /// real hardware.
     pub fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, pixels: &[u16]) -> io::Result<()> {
-        self.set_address_window(x as u8, y as u8, (x + w - 1) as u8, (y + h - 1) as u8)?;
-        let bytes: Vec<u8> = pixels[..w as usize * h as usize]
-            .iter()
-            .flat_map(|p| p.to_be_bytes())
-            .collect();
-        self.burst_transfer(&bytes)
+        const MAX_SESSION_BYTES: usize = 16 * 160 * 2;
+
+        let pixels = &pixels[..w as usize * h as usize];
+        let session_rows = (MAX_SESSION_BYTES / (2 * w as usize)).max(1) as u16;
+        let mut row = 0;
+        while row < h {
+            let rows = session_rows.min(h - row);
+            self.set_address_window(
+                x as u8,
+                (y + row) as u8,
+                (x + w - 1) as u8,
+                (y + row + rows - 1) as u8,
+            )?;
+            let span = &pixels[row as usize * w as usize..(row + rows) as usize * w as usize];
+            let bytes: Vec<u8> = span.iter().flat_map(|p| p.to_be_bytes()).collect();
+            self.burst_transfer(&bytes)?;
+            row += rows;
+        }
+        Ok(())
     }
 }

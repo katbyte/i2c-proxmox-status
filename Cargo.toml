@@ -5,4 +5,6 @@ edition = "2021"
 description = "Proxmox stats on the UCTRONICS SKU_RM0004 rack-mount LCD (ST7735 over I2C)"
 
 [dependencies]
+embedded-graphics = "0.8"
 libc = "0.2"
+sysinfo = "0.36"
