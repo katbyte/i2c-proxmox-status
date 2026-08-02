@@ -10,9 +10,40 @@ use std::net::UdpSocket;
 use std::thread;
 use std::time::Duration;
 
-/// CPU usage percentage, measured as the busy share of /proc/stat deltas
-/// over a short sampling window.
-pub fn cpu_percent() -> io::Result<u8> {
+/// CPU usage from /proc/stat deltas. Keeps the previous sample between
+/// calls, so each reading covers the interval since the last one and never
+/// has to sleep mid-render (which would stall the display).
+pub struct CpuSampler {
+    last: Option<(u64, u64)>, // (total, idle) jiffies
+}
+
+impl CpuSampler {
+    pub fn new() -> Self {
+        Self { last: None }
+    }
+
+    pub fn percent(&mut self) -> io::Result<u8> {
+        let mut current = Self::sample()?;
+        let last = match self.last {
+            Some(last) => last,
+            None => {
+                // First reading: no history yet, take a short window.
+                let first = current;
+                thread::sleep(Duration::from_millis(100));
+                current = Self::sample()?;
+                first
+            }
+        };
+        self.last = Some(current);
+
+        let total = current.0.saturating_sub(last.0);
+        let idle = current.1.saturating_sub(last.1);
+        if total == 0 {
+            return Ok(0);
+        }
+        Ok((100 * (total - idle) / total) as u8)
+    }
+
     fn sample() -> io::Result<(u64, u64)> {
         let stat = fs::read_to_string("/proc/stat")?;
         let line = stat
@@ -29,17 +60,6 @@ pub fn cpu_percent() -> io::Result<u8> {
         let idle = fields.get(3).copied().unwrap_or(0) + fields.get(4).copied().unwrap_or(0);
         Ok((total, idle))
     }
-
-    let (total_a, idle_a) = sample()?;
-    thread::sleep(Duration::from_millis(250));
-    let (total_b, idle_b) = sample()?;
-
-    let total = total_b.saturating_sub(total_a);
-    let idle = idle_b.saturating_sub(idle_a);
-    if total == 0 {
-        return Ok(0);
-    }
-    Ok((100 * (total - idle) / total) as u8)
 }
 
 /// Memory usage percentage from /proc/meminfo, matching the C version's
@@ -84,6 +104,28 @@ pub fn disk_percent() -> io::Result<u8> {
         return Ok(0);
     }
     Ok((100 * (total - free) / total) as u8)
+}
+
+/// Fully qualified hostname: the kernel hostname, extended to an FQDN via
+/// /etc/hosts if it's a short name (the usual Proxmox setup).
+pub fn fqdn() -> String {
+    let short = fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    if short.contains('.') {
+        return short;
+    }
+    if let Ok(hosts) = fs::read_to_string("/etc/hosts") {
+        for line in hosts.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            for token in line.split_whitespace().skip(1) {
+                if token.strip_prefix(short.as_str()).is_some_and(|rest| rest.starts_with('.')) {
+                    return token.to_string();
+                }
+            }
+        }
+    }
+    short
 }
 
 /// Primary IPv4 address, discovered by "connecting" a UDP socket toward a

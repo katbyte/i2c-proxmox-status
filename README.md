@@ -8,9 +8,9 @@ SKU RM0004). The original C and Python sources remain in git history.
 ## What it does
 
 Cycles the front-panel LCD through four status screens — CPU load, RAM usage,
-SoC temperature, and disk usage — one every two seconds, with the host's IP
-address in a header line. Stats are read locally from `/proc`, sysfs, and
-statvfs(2).
+SoC temperature, and disk usage — one every two seconds. A header line shows
+`ip - hostname.fqdn`, scrolling as a slow marquee when it's too wide for the
+display. Stats are read locally from `/proc`, sysfs, and statvfs(2).
 
 The end goal is to show Proxmox host stats pulled from the Proxmox API
 instead of local readings; that part isn't built yet.
@@ -66,12 +66,14 @@ background color per bit.
 
 ### Screens
 
-`src/screens.rs` implements the rotation. A layout contract inherited from
-the C code: the CPU screen repaints the whole display (IP header, blue
-divider bar, value line, gauge); the RAM/TEMP/DISK screens repaint only the
-value line and gauge, so the header persists across the cycle. The gauge is
-ten 6x10 segments at the bottom, filled proportionally to the percentage in
-a per-screen color (green/yellow/red/blue), gray for the remainder.
+`src/screens.rs` implements the header and the rotation. The static
+background (black fill plus the blue divider bar) is painted once at
+startup; after that the header and each screen repaint only their own
+regions, so the display never visibly wipes. The header marquee is
+rasterized into an offscreen buffer and blitted in one burst per scroll
+step; each stat screen repaints its value line and gauge. The gauge is ten
+6x10 segments at the bottom, filled proportionally to the percentage in a
+per-screen color (green/yellow/red/blue), gray for the remainder.
 
 ## Build and run
 

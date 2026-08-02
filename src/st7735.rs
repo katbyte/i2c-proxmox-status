@@ -172,9 +172,14 @@ impl Lcd {
         self.write_command(SYNC_REG, 0x00, 0x01)
     }
 
-    /// Draw a w*h block of big-endian RGB565 pixel data at (x, y).
-    pub fn draw_image(&mut self, x: u16, y: u16, w: u16, h: u16, data: &[u8]) -> io::Result<()> {
+    /// Draw a w*h block of RGB565 pixels at (x, y) in one burst — much faster
+    /// than per-pixel writes for anything bigger than a glyph.
+    pub fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, pixels: &[u16]) -> io::Result<()> {
         self.set_address_window(x as u8, y as u8, (x + w - 1) as u8, (y + h - 1) as u8)?;
-        self.burst_transfer(&data[..2 * w as usize * h as usize])
+        let bytes: Vec<u8> = pixels[..w as usize * h as usize]
+            .iter()
+            .flat_map(|p| p.to_be_bytes())
+            .collect();
+        self.burst_transfer(&bytes)
     }
 }
