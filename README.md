@@ -1,38 +1,43 @@
-# SKU_RM0004
-The project supports running on RaspberryPi, Ubuntu, [HomeAssistant](https://github.com/UCTRONICS/UCTRONICS_RM0004_HA),You can also use Python to call compiled DLLs on these platforms.
-# RaspberryPi
+# i2c-proxmox-status
 
-## Deployment service
->  Clone SKU_RM0004 library 
+A straight Rust conversion of the C display daemon from
+[UCTRONICS/SKU_RM0004](https://github.com/UCTRONICS/SKU_RM0004), the firmware
+companion for the UCTRONICS Raspberry Pi 1U rack mount. The original C and
+Python sources remain in git history.
+
+## What it does
+
+Cycles the front-panel LCD through four status screens — CPU load, RAM usage,
+SoC temperature, and disk usage — one every two seconds, with the host's IP
+address in a header line. Stats are read locally from `/proc`, sysfs, and
+statvfs(2).
+
+The end goal is to show Proxmox host stats pulled from the Proxmox API
+instead of local readings; that part isn't built yet.
+
+## The display
+
+The rack mount's front panel is a 0.96" 160x80 color LCD driven by an ST7735
+controller. The Pi doesn't talk to the ST7735 directly: an RP2040 on the
+board bridges I2C to the panel, appearing at address `0x18` on `/dev/i2c-1`.
+Every write is a 3-byte `[register, high, low]` transaction against the
+bridge's register map (coordinate, data, burst, and sync registers) — so
+generic SPI ST7735 drivers don't apply here.
+
+## Build and run
+
+Needs Rust 1.85+ (`apt install cargo` on Debian 13 is enough) and I2C enabled
+on the Pi.
+
 ```bash
-git clone https://github.com/UCTRONICS/SKU_RM0004.git
+cargo build --release
+sudo ./target/release/i2c-proxmox-status   # sudo unless your user is in the i2c group
 ```
-> Compile 
-```bash
-cd SKU_RM0004
-make clean && make 
-```
-## Add automatic start script
-```bash
-./deployment_service.sh   
-```
-**reboot your system**
-```bash
-sudo reboot
-```
-## How to uninstall the uctronics-display.service
 
-```bash
-sudo systemctl disable uctronics-display.service
-sudo rm /etc/systemd/system/uctronics-display.service
-sudo systemctl daemon-reload
-```
-## How to use NVMe 
-***Note: only for Raspberry Pi 5 and UC-B86 NVMe hat***
+## Layout
 
-https://github.com/UCTRONICS/SKU_RM0004/blob/main/data/NVMe_User_Guide.md
-
-
-
-
-
+- `src/st7735.rs` — display driver (the board's I2C register protocol, not raw ST7735)
+- `src/fonts.rs` — bitmap fonts, generated from the original C `fonts.c`
+- `src/stats.rs` — stat collection (`/proc`, sysfs, statvfs)
+- `src/screens.rs` — `Screen` trait and the four status screens
+- `src/main.rs` — the display loop

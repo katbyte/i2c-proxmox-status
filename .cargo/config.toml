@@ -1,0 +1,5 @@
+# This repo often lives on a network mount (SMB/NFS) that doesn't support the
+# file locking rustc's incremental cache needs; incremental is a minor win for
+# a crate this size anyway.
+[build]
+incremental = false

@@ -1,4 +1,8 @@
-build/
-obj/
-display
+# Rust
+/target/
+
+# RustRover / JetBrains
+.idea/
+
 .vscode/
+.claude/
