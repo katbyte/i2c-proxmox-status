@@ -74,13 +74,16 @@ impl Lcd {
         self.write_command(SYNC_REG, 0x00, 0x01)
     }
 
+}
+
+impl crate::framebuffer::PixelSink for Lcd {
     /// Draw a w*h block of RGB565 pixels at (x, y).
     ///
     /// Split into windows of at most MAX_SESSION_BYTES each: longer burst
     /// sessions overrun the bridge firmware and the content lands displaced
     /// on the panel. 16 full-width rows is the largest session verified on
     /// real hardware.
-    pub fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, pixels: &[u16]) -> io::Result<()> {
+    fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, pixels: &[u16]) -> io::Result<()> {
         const MAX_SESSION_BYTES: usize = 16 * 160 * 2;
 
         let pixels = &pixels[..w as usize * h as usize];

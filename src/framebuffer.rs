@@ -14,10 +14,16 @@ use std::io;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 
-use crate::st7735::{Lcd, HEIGHT, WIDTH};
+use crate::st7735::{HEIGHT, WIDTH};
 
 const W: usize = WIDTH as usize;
 const H: usize = HEIGHT as usize;
+
+/// Where flushed pixels go: the real panel, or the SDL simulator.
+pub trait PixelSink {
+    /// Draw a w*h block of raw RGB565 pixels at (x, y).
+    fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, pixels: &[u16]) -> io::Result<()>;
+}
 
 pub struct FrameBuffer {
     back: Vec<u16>,  // RGB565, what the next flush should show
@@ -43,7 +49,7 @@ impl FrameBuffer {
     /// original C code used), and narrow windows at arbitrary offsets showed
     /// displaced/stale pixels on real hardware. A full 160px row is 320
     /// bytes (~9ms), so the saving wasn't worth the risk anyway.
-    pub fn flush(&mut self, lcd: &mut Lcd) -> io::Result<()> {
+    pub fn flush(&mut self, sink: &mut impl PixelSink) -> io::Result<()> {
         let mut y = 0;
         while y < H {
             if !self.row_dirty(y) {
@@ -56,7 +62,7 @@ impl FrameBuffer {
             }
 
             let band = band_start * W..y * W;
-            lcd.blit(
+            sink.blit(
                 0,
                 band_start as u16,
                 WIDTH,

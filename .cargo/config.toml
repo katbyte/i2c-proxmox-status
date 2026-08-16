@@ -3,3 +3,15 @@
 # a crate this size anyway.
 [build]
 incremental = false
+
+# Homebrew's SDL2 (for the simulator feature) on Apple Silicon.
+[target.aarch64-apple-darwin]
+rustflags = ["-L", "/opt/homebrew/lib"]
+
+# Build from the committed vendor/ directory instead of crates.io.
+# Refresh it with `cargo vendor` after changing dependencies.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
