@@ -4,7 +4,7 @@
 ![build](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/build.yaml/badge.svg)
 ![test](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/test.yaml/badge.svg)
 ![lint](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/lint.yaml/badge.svg)
-[![License](https://img.shields.io/github/license/katbyte/uctronics-rpi-proxmox-display?color=blue)](https://github.com/katbyte/uctronics-rpi-proxmox-display)
+[![License](https://img.shields.io/github/license/katbyte/uctronics-rpi-proxmox-display?color=blue)](https://github.com/katbyte/uctronics-rpi-proxmox-display/blob/main/LICENSE)
 
 Host stats on the front-panel LCD of the UCTRONICS Pi Rack Pro (19" 1U rack
 mount for Raspberry Pi, SKU RM0004). A ground-up Rust rewrite of the C
@@ -15,7 +15,9 @@ original C and Python sources remain in git history.
 Rotates the 160x80 panel through btop-style stat pages under a header line
 that pages between the IP and the hostname and doubles as a status light.
 Stats come from the [sysinfo](https://crates.io/crates/sysinfo) crate plus
-direct reads of `/proc`, `/sys`, and `/etc/pve`.
+direct reads of `/proc`, `/sys`, and `/etc/pve`. A rack full of Pis can
+[rotate in lockstep](#syncing-panels-across-pis) — every panel showing the
+same page at the same moment — with nothing but their clocks.
 
 ## Pages
 
@@ -122,6 +124,39 @@ On exit the daemon leaves a full-screen message on the panel (the bridge
 MCU keeps showing the last frame after the process stops): `--close-text`
 (default `CLOSED`, white) on a clean exit via ctrl-c/SIGTERM, and
 `--crash-text` (default `CRASH`, red) if the daemon panics.
+
+## Syncing panels across Pis
+
+With several trays in the rack, staggered rotations look messy. Pass
+`--clock-sync <minutes>` on every host and the panels rotate in lockstep
+with no communication between them: the current page is computed purely
+from unix time, so hosts with synced clocks (NTP — chrony or
+systemd-timesyncd, already running on any Proxmox or Raspberry Pi OS
+install) land on the same page at the same moment. The rotation restarts
+from the first page at each period boundary — `--clock-sync 10` means
+:00, :10, :20 … past every hour.
+
+For it to line up, every host must run the **same `--pages` list and the
+same `--page-hold`** (they define the slot layout). Installed as the
+systemd service, add the flag with a drop-in on each host:
+
+```bash
+sudo systemctl edit i2c-proxmox-status
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/i2c-proxmox-status --clock-sync 10
+```
+
+then `sudo systemctl restart i2c-proxmox-status`.
+
+One caveat: the `warnings` page only shows on a host that has warnings.
+During its slot, healthy panels skip ahead to the next page while an
+unhealthy one shows its warnings; everything realigns on the next slot —
+arguably a feature, since the odd panel out is the one that needs
+attention.
 
 ## The header
 

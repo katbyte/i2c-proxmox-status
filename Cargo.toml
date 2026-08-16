@@ -3,6 +3,7 @@ name = "i2c-proxmox-status"
 version = "0.1.0"
 edition = "2021"
 description = "Proxmox stats on the UCTRONICS SKU_RM0004 rack-mount LCD (ST7735 over I2C)"
+license = "GPL-3.0-only"
 
 [dependencies]
 embedded-graphics = "0.8"
