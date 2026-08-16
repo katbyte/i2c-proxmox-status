@@ -47,13 +47,18 @@ impl SimLcd {
 
     fn snapshot(&mut self) {
         let Some(dir) = &self.snapshots else { return };
-        if self.last_snapshot.is_some_and(|last| last.elapsed() < Duration::from_secs(1)) {
+        if self
+            .last_snapshot
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
             return;
         }
         self.last_snapshot = Some(Instant::now());
         let path = dir.join(format!("frame_{:04}.png", self.snapshot_count));
         self.snapshot_count += 1;
-        let image = self.display.to_rgb_output_image(&OutputSettingsBuilder::new().build());
+        let image = self
+            .display
+            .to_rgb_output_image(&OutputSettingsBuilder::new().build());
         if let Err(e) = image.save_png(&path) {
             eprintln!("snapshot failed: {e}");
         }
@@ -64,18 +69,25 @@ impl PixelSink for SimLcd {
     fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, pixels: &[u16]) -> io::Result<()> {
         thread::sleep(bus_time(w, h));
 
-        let pixels = pixels[..w as usize * h as usize].iter().enumerate().map(|(i, &raw)| {
-            let point = Point::new(
-                x as i32 + (i % w as usize) as i32,
-                y as i32 + (i / w as usize) as i32,
-            );
-            Pixel(point, Rgb565::from(RawU16::new(raw)))
-        });
+        let pixels = pixels[..w as usize * h as usize]
+            .iter()
+            .enumerate()
+            .map(|(i, &raw)| {
+                let point = Point::new(
+                    x as i32 + (i % w as usize) as i32,
+                    y as i32 + (i / w as usize) as i32,
+                );
+                Pixel(point, Rgb565::from(RawU16::new(raw)))
+            });
         self.display.draw_iter(pixels).unwrap();
 
         self.window.update(&self.display);
         self.snapshot();
-        if self.window.events().any(|e| matches!(e, SimulatorEvent::Quit)) {
+        if self
+            .window
+            .events()
+            .any(|e| matches!(e, SimulatorEvent::Quit))
+        {
             std::process::exit(0);
         }
         Ok(())

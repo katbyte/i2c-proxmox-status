@@ -73,7 +73,6 @@ impl Lcd {
         self.write_command(CHAR_DATA_REG, 0x00, 0x00)?;
         self.write_command(SYNC_REG, 0x00, 0x01)
     }
-
 }
 
 impl crate::framebuffer::PixelSink for Lcd {

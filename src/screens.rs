@@ -163,10 +163,10 @@ pub struct Header {
     text: String,
     mode: HeaderMode,
     align: HeaderAlign,
-    hold: Duration,   // how long each page shows in the cut/wipe modes
-    color: Rgb565, // text color; the caller sets it to reflect host status
-    sync: bool,    // change only at page-rotation changes (see trigger())
-    armed: bool,   // sync mode: a rotation change just happened
+    hold: Duration, // how long each page shows in the cut/wipe modes
+    color: Rgb565,  // text color; the caller sets it to reflect host status
+    sync: bool,     // change only at page-rotation changes (see trigger())
+    armed: bool,    // sync mode: a rotation change just happened
     // slide state
     offset: i32,
     span: i32, // marquee period: text width plus the gap between repeats
@@ -246,7 +246,13 @@ fn paginate(text: &str, font: &MonoFont) -> Vec<String> {
 }
 
 impl Header {
-    pub fn new(text: &str, mode: HeaderMode, align: HeaderAlign, hold: Duration, sync: bool) -> Self {
+    pub fn new(
+        text: &str,
+        mode: HeaderMode,
+        align: HeaderAlign,
+        hold: Duration,
+        sync: bool,
+    ) -> Self {
         let span = text_width(HEADER_FONT, text) + SCROLL_GAP_PX;
         Self {
             text: text.to_string(),
@@ -260,7 +266,10 @@ impl Header {
             span,
             // Cut/wipe modes page at the " - " between the IP and the
             // hostname; a part still too wide is further split to fit.
-            pages: text.split(" - ").flat_map(|part| paginate(part, HEADER_FONT)).collect(),
+            pages: text
+                .split(" - ")
+                .flat_map(|part| paginate(part, HEADER_FONT))
+                .collect(),
             page: 0,
             phase: Phase::Hold(Instant::now() + hold),
         }
@@ -316,7 +325,12 @@ impl Header {
         match self.mode {
             HeaderMode::Slide => self.draw_slide(fb),
             _ if self.pages.len() <= 1 => {
-                draw_header_text(fb, &self.text, Point::new(self.align_x(&self.text), 0), self.color);
+                draw_header_text(
+                    fb,
+                    &self.text,
+                    Point::new(self.align_x(&self.text), 0),
+                    self.color,
+                );
                 false
             }
             HeaderMode::Cut => self.draw_cut(fb, busy),
@@ -342,11 +356,21 @@ impl Header {
             // Two copies, one span apart; the framebuffer clips off-screen
             // pixels, so we don't care which parts land outside.
             draw_header_text(fb, &self.text, Point::new(-self.offset, 0), self.color);
-            draw_header_text(fb, &self.text, Point::new(-self.offset + self.span, 0), self.color);
+            draw_header_text(
+                fb,
+                &self.text,
+                Point::new(-self.offset + self.span, 0),
+                self.color,
+            );
             self.offset = (self.offset + 1) % self.span;
             true
         } else {
-            draw_header_text(fb, &self.text, Point::new(self.align_x(&self.text), 0), self.color);
+            draw_header_text(
+                fb,
+                &self.text,
+                Point::new(self.align_x(&self.text), 0),
+                self.color,
+            );
             false
         }
     }
@@ -611,12 +635,21 @@ impl Page for TempsPage {
         }
         for (i, series) in history.temps.iter().take(2).enumerate() {
             let y = i as i32 * TEMP_ROW_H;
-            let live = if series.label == "CPU" { cpu_now } else { nvme_now };
+            let live = if series.label == "CPU" {
+                cpu_now
+            } else {
+                nvme_now
+            };
             let current = live.or_else(|| series.samples.back().copied()).unwrap_or(0);
             let label_style = MonoTextStyle::new(CPUS_FONT, Rgb565::WHITE);
-            Text::with_baseline(series.label, Point::new(0, y + 10), label_style, Baseline::Top)
-                .draw(fb)
-                .unwrap();
+            Text::with_baseline(
+                series.label,
+                Point::new(0, y + 10),
+                label_style,
+                Baseline::Top,
+            )
+            .draw(fb)
+            .unwrap();
             draw_sparkline(
                 fb,
                 &series.samples,
@@ -687,10 +720,18 @@ impl Page for MemPage {
     fn render(&mut self, fb: &mut PageTarget<'_, '_>, stats: &mut Stats) {
         let history = self.sampler.snapshot();
         let (used, total) = stats.memory_used_total();
-        let percent = if total == 0 { 0 } else { (used * 100 / total) as u8 };
+        let percent = (used * 100).checked_div(total).unwrap_or(0) as u8;
 
         draw_vertical_label(fb, "RAM", &FONT_10X20);
-        draw_sparkline(fb, &history.mem, MEM_GRAPH_X, 4, MEM_GRAPH_WIDTH, 52, usage_color);
+        draw_sparkline(
+            fb,
+            &history.mem,
+            MEM_GRAPH_X,
+            4,
+            MEM_GRAPH_WIDTH,
+            52,
+            usage_color,
+        );
 
         let text = format!("{percent}%");
         let x = WIDTH as i32 - text_width(&FONT_10X20, &text);
@@ -704,9 +745,10 @@ impl Page for MemPage {
         // as the shared unit column at the right edge.
         let dim = Rgb565::new(20, 40, 20);
         let num_right = WIDTH as i32 - 8;
-        for (line, y, color) in
-            [(format_gib(used), 30, Rgb565::WHITE), (format_gib(total), 45, dim)]
-        {
+        for (line, y, color) in [
+            (format_gib(used), 30, Rgb565::WHITE),
+            (format_gib(total), 45, dim),
+        ] {
             let style = MonoTextStyle::new(&FONT_9X15, color);
             let x = num_right - text_width(&FONT_9X15, &line);
             Text::with_baseline(&line, Point::new(x, y), style, Baseline::Top)
@@ -754,8 +796,7 @@ impl DrawTarget for GlyphBuffer {
     {
         for Pixel(point, color) in pixels {
             if (0..self.w as i32).contains(&point.x) && (0..self.h as i32).contains(&point.y) {
-                self.bits[point.y as usize * self.w + point.x as usize] =
-                    color != Rgb565::BLACK;
+                self.bits[point.y as usize * self.w + point.x as usize] = color != Rgb565::BLACK;
             }
         }
         Ok(())
@@ -773,9 +814,15 @@ fn draw_scaled_text(
 ) {
     let w = text_width(font, text) as usize;
     let h = font.character_size.height as usize;
-    let mut buf = GlyphBuffer { w, h, bits: vec![false; w * h] };
+    let mut buf = GlyphBuffer {
+        w,
+        h,
+        bits: vec![false; w * h],
+    };
     let style = MonoTextStyle::new(font, Rgb565::WHITE);
-    Text::with_baseline(text, Point::zero(), style, Baseline::Top).draw(&mut buf).unwrap();
+    Text::with_baseline(text, Point::zero(), style, Baseline::Top)
+        .draw(&mut buf)
+        .unwrap();
     for y in 0..h {
         for x in 0..w {
             if buf.bits[y * w + x] {
@@ -792,7 +839,13 @@ fn draw_scaled_text(
 /// A byte rate split into a short number and the unit that scales it,
 /// e.g. (14, "B/s"), ("739", "kB/s"), ("1.2", "MB/s").
 fn format_rate(bytes_per_sec: u32) -> (String, &'static str) {
-    let scaled = |v: f64| if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") };
+    let scaled = |v: f64| {
+        if v < 10.0 {
+            format!("{v:.1}")
+        } else {
+            format!("{v:.0}")
+        }
+    };
     let n = bytes_per_sec as f64;
     if n < 1e3 {
         (bytes_per_sec.to_string(), "B/s")
@@ -818,6 +871,7 @@ fn format_count(n: u32) -> String {
 /// Per-sample columns like `draw_sparkline`, but for unbounded counts:
 /// scaled to the window's peak value rather than 0-100. `floor` is the
 /// minimum peak, so idle-time jitter doesn't fill the graph.
+#[allow(clippy::too_many_arguments)]
 fn draw_sparkline_scaled(
     fb: &mut PageTarget<'_, '_>,
     samples: &VecDeque<u32>,
@@ -828,10 +882,17 @@ fn draw_sparkline_scaled(
     floor: u32,
     color: Rgb565,
 ) {
-    let peak = samples.iter().rev().take(width).copied().max().unwrap_or(0).max(floor) as u64;
+    let peak = samples
+        .iter()
+        .rev()
+        .take(width)
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(floor) as u64;
     for (i, &value) in samples.iter().rev().take(width).enumerate() {
         let x = x0 + width as i32 - 1 - i as i32;
-        let bar = ((value as u64 * height as u64 + peak - 1) / peak) as i32;
+        let bar = (value as u64 * height as u64).div_ceil(peak) as i32;
         if bar > 0 {
             Rectangle::new(Point::new(x, y0 + height - bar), Size::new(1, bar as u32))
                 .into_styled(PrimitiveStyle::with_fill(color))
@@ -856,7 +917,7 @@ impl DiskPage {
 impl Page for DiskPage {
     fn render(&mut self, fb: &mut PageTarget<'_, '_>, stats: &mut Stats) {
         let (used, total) = stats.disk_used_total();
-        let percent = if total == 0 { 0 } else { (used * 100 / total) as u8 };
+        let percent = (used * 100).checked_div(total).unwrap_or(0) as u8;
         let fill_color = match percent {
             0..=79 => Rgb565::GREEN,
             80..=89 => Rgb565::YELLOW,
@@ -867,7 +928,9 @@ impl Page for DiskPage {
         draw_vertical_label(fb, "DISK", &FONT_9X15);
         // Continuous fullness bar: gray track, filled to the used fraction.
         const BAR: Rectangle = Rectangle::new(Point::new(11, 4), Size::new(88, 8));
-        BAR.into_styled(PrimitiveStyle::with_fill(GRAY)).draw(fb).unwrap();
+        BAR.into_styled(PrimitiveStyle::with_fill(GRAY))
+            .draw(fb)
+            .unwrap();
         let filled = (percent.min(100) as u32 * BAR.size.width) / 100;
         Rectangle::new(BAR.top_left, Size::new(filled, BAR.size.height))
             .into_styled(PrimitiveStyle::with_fill(fill_color))
@@ -888,7 +951,16 @@ impl Page for DiskPage {
         draw_scaled_text(fb, &text, &FONT_9X15, Point::new(x, 0), 2, fill_color);
 
         let history = self.sampler.snapshot();
-        draw_sparkline_scaled(fb, &history.iops, IO_GRAPH_X, 32, IO_GRAPH_WIDTH, 26, 50, IO_COLOR);
+        draw_sparkline_scaled(
+            fb,
+            &history.iops,
+            IO_GRAPH_X,
+            32,
+            IO_GRAPH_WIDTH,
+            26,
+            50,
+            IO_COLOR,
+        );
         let current = history.iops.back().copied().unwrap_or(0);
         let text = format_count(current);
         let x = WIDTH as i32 - text_width(CPUS_FONT, &text);
@@ -924,11 +996,17 @@ fn draw_net_half(
     height: i32,
     color: Rgb565,
 ) {
-    let peak = samples.iter().rev().take(NET_GRAPH_WIDTH).copied().max().unwrap_or(0).max(10_000)
-        as u64;
+    let peak = samples
+        .iter()
+        .rev()
+        .take(NET_GRAPH_WIDTH)
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(10_000) as u64;
     for (i, &value) in samples.iter().rev().take(NET_GRAPH_WIDTH).enumerate() {
         let x = NET_GRAPH_X + NET_GRAPH_WIDTH as i32 - 1 - i as i32;
-        let bar = ((value as u64 * height as u64 + peak - 1) / peak) as i32;
+        let bar = (value as u64 * height as u64).div_ceil(peak) as i32;
         if bar > 0 {
             let y = if up { mid - bar } else { mid + 1 };
             Rectangle::new(Point::new(x, y), Size::new(1, bar as u32))
@@ -956,12 +1034,22 @@ impl Page for NetPage {
     fn render(&mut self, fb: &mut PageTarget<'_, '_>, _stats: &mut Stats) {
         let history = self.sampler.snapshot();
         let mid = PAGE_HEIGHT as i32 / 2;
-        Rectangle::new(Point::new(NET_GRAPH_X, mid), Size::new(NET_GRAPH_WIDTH as u32, 1))
-            .into_styled(PrimitiveStyle::with_fill(GRAY))
-            .draw(fb)
-            .unwrap();
+        Rectangle::new(
+            Point::new(NET_GRAPH_X, mid),
+            Size::new(NET_GRAPH_WIDTH as u32, 1),
+        )
+        .into_styled(PrimitiveStyle::with_fill(GRAY))
+        .draw(fb)
+        .unwrap();
         draw_net_half(fb, &history.net_rx, mid, true, mid, NET_IN_COLOR);
-        draw_net_half(fb, &history.net_tx, mid, false, PAGE_HEIGHT as i32 - mid - 1, NET_OUT_COLOR);
+        draw_net_half(
+            fb,
+            &history.net_tx,
+            mid,
+            false,
+            PAGE_HEIGHT as i32 - mid - 1,
+            NET_OUT_COLOR,
+        );
 
         // Vertical labels at the left edge of each half, and the current
         // rate stacked over its unit at the right — all clear of the graph.
@@ -1056,7 +1144,11 @@ impl Page for ProxmoxPage {
         }
         draw_sparkline(fb, &history.load, 8, 32, GRAPH_WIDTH, 26, usage_color);
         let load = stats::load_average();
-        let text = if load < 10.0 { format!("{load:.2}") } else { format!("{load:.1}") };
+        let text = if load < 10.0 {
+            format!("{load:.2}")
+        } else {
+            format!("{load:.1}")
+        };
         let pct = history.load.back().copied().unwrap_or(0);
         let x = WIDTH as i32 - text_width(CPUS_FONT, &text);
         let style = MonoTextStyle::new(CPUS_FONT, usage_color(pct));
@@ -1090,11 +1182,20 @@ impl Page for WarningsPage {
             return;
         }
         for (i, warning) in warnings.iter().take(6).enumerate() {
-            let color = if warning.severe { Rgb565::RED } else { Rgb565::YELLOW };
+            let color = if warning.severe {
+                Rgb565::RED
+            } else {
+                Rgb565::YELLOW
+            };
             let style = MonoTextStyle::new(CPUS_FONT, color);
-            Text::with_baseline(&warning.text, Point::new(0, i as i32 * 10), style, Baseline::Top)
-                .draw(fb)
-                .unwrap();
+            Text::with_baseline(
+                &warning.text,
+                Point::new(0, i as i32 * 10),
+                style,
+                Baseline::Top,
+            )
+            .draw(fb)
+            .unwrap();
         }
     }
 }

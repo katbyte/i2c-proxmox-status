@@ -90,15 +90,19 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
             if let Some(value) = reading {
                 // Seed with the current reading so the graph isn't empty
                 // until the first (possibly minutes-away) interval tick.
-                history.temps.push(TempSeries { label, samples: VecDeque::from([value]) });
+                history.temps.push(TempSeries {
+                    label,
+                    samples: VecDeque::from([value]),
+                });
             }
         }
         // Memory gets the same seeding — its window is measured in hours.
         system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         let total = system.total_memory();
-        if total > 0 {
-            push_capped(&mut history.mem, (system.used_memory() * 100 / total) as u8);
-        }
+        push_capped(
+            &mut history.mem,
+            (system.used_memory() * 100).checked_div(total).unwrap_or(0) as u8,
+        );
     }
 
     let now = Instant::now();
@@ -116,14 +120,20 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
     };
 
     loop {
-        let next = next_cpu.min(next_temp).min(next_mem).min(next_io).min(next_net);
+        let next = next_cpu
+            .min(next_temp)
+            .min(next_mem)
+            .min(next_io)
+            .min(next_net);
         thread::sleep(next.saturating_duration_since(Instant::now()));
         let now = Instant::now();
 
         if now >= next_cpu {
             system.refresh_cpu_usage();
             let mut history = sink.lock().unwrap();
-            history.cores.resize_with(system.cpus().len(), VecDeque::new);
+            history
+                .cores
+                .resize_with(system.cpus().len(), VecDeque::new);
             push_capped(&mut history.total, system.global_cpu_usage().round() as u8);
             for (core, samples) in system.cpus().iter().zip(&mut history.cores) {
                 push_capped(samples, core.cpu_usage().round() as u8);
@@ -141,7 +151,9 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
                 let reading = if series.label == "CPU" { cpu } else { nvme };
                 // A dropped reading repeats the last value rather than
                 // spiking the graph to zero.
-                let value = reading.or_else(|| series.samples.back().copied()).unwrap_or(0);
+                let value = reading
+                    .or_else(|| series.samples.back().copied())
+                    .unwrap_or(0);
                 push_capped(&mut series.samples, value);
             }
             bump(&mut next_temp, cfg.temp);
@@ -149,8 +161,7 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
         if now >= next_mem {
             system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
             let total = system.total_memory();
-            let percent =
-                if total == 0 { 0 } else { (system.used_memory() * 100 / total) as u8 };
+            let percent = (system.used_memory() * 100).checked_div(total).unwrap_or(0) as u8;
             push_capped(&mut sink.lock().unwrap().mem, percent);
             bump(&mut next_mem, cfg.mem);
         }
@@ -243,7 +254,10 @@ fn sensor_temps(components: &Components) -> (Option<u8>, Option<u8>) {
 /// Fake but believable sensor readings: slow sine drifts plus a faster
 /// wiggle, distinct periods per sensor so the graphs don't move in step.
 fn mock_temps() -> (Option<u8>, Option<u8>) {
-    let t = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs_f64();
+    let t = std::time::UNIX_EPOCH
+        .elapsed()
+        .unwrap_or_default()
+        .as_secs_f64();
     let cpu = 55.0 + 9.0 * (t / 990.0).sin() + 5.0 * (t / 97.0).sin() + 2.0 * (t / 13.0).sin();
     let nvme = 42.0 + 5.0 * (t / 1370.0).sin() + 3.0 * (t / 151.0).sin();
     (Some(cpu.round() as u8), Some(nvme.round() as u8))
@@ -315,7 +329,8 @@ impl Stats {
 
     /// Used memory as sysinfo reports it (total minus available).
     pub fn memory_percent(&mut self) -> u8 {
-        self.system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        self.system
+            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         let total = self.system.total_memory();
         if total == 0 {
             return 0;
@@ -346,7 +361,8 @@ impl Stats {
 
     /// Used and total memory in bytes.
     pub fn memory_used_total(&mut self) -> (u64, u64) {
-        self.system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        self.system
+            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         (self.system.used_memory(), self.system.total_memory())
     }
 
@@ -362,7 +378,11 @@ impl Stats {
     /// Used and total space on the root filesystem, in bytes.
     pub fn disk_used_total(&mut self) -> (u64, u64) {
         self.disks.refresh(true);
-        let Some(root) = self.disks.iter().find(|d| d.mount_point() == Path::new("/")) else {
+        let Some(root) = self
+            .disks
+            .iter()
+            .find(|d| d.mount_point() == Path::new("/"))
+        else {
             return (0, 0);
         };
         let total = root.total_space();
@@ -385,7 +405,10 @@ pub fn proxmox_vms() -> Option<GuestCounts> {
         return None;
     }
     let Ok(entries) = fs::read_dir("/etc/pve/qemu-server") else {
-        return Some(GuestCounts { running: 0, total: 0 });
+        return Some(GuestCounts {
+            running: 0,
+            total: 0,
+        });
     };
     let ids: Vec<String> = entries
         .flatten()
@@ -398,7 +421,10 @@ pub fn proxmox_vms() -> Option<GuestCounts> {
         .iter()
         .filter(|id| Path::new(&format!("/var/run/qemu-server/{id}.pid")).exists())
         .count();
-    Some(GuestCounts { running, total: ids.len() })
+    Some(GuestCounts {
+        running,
+        total: ids.len(),
+    })
 }
 
 /// Host uptime formatted to fit the panel: "4d3h", "7h12m", or "42m".
@@ -453,9 +479,15 @@ impl Stats {
         ];
         for (bit, name) in bits {
             if flags & (1 << bit) != 0 {
-                severe.push(Warning { text: name.to_string(), severe: true });
+                severe.push(Warning {
+                    text: name.to_string(),
+                    severe: true,
+                });
             } else if flags & (1 << (bit + 16)) != 0 {
-                minor.push(Warning { text: format!("{name} SINCE BOOT"), severe: false });
+                minor.push(Warning {
+                    text: format!("{name} SINCE BOOT"),
+                    severe: false,
+                });
             }
         }
 
@@ -463,25 +495,38 @@ impl Stats {
         for (label, temp) in [("CPU", cpu), ("NVME", nvme)] {
             let Some(t) = temp else { continue };
             if t >= 85 {
-                severe.push(Warning { text: format!("{label} HOT {t}\u{b0}"), severe: true });
+                severe.push(Warning {
+                    text: format!("{label} HOT {t}\u{b0}"),
+                    severe: true,
+                });
             } else if t >= 75 {
-                minor.push(Warning { text: format!("{label} WARM {t}\u{b0}"), severe: false });
+                minor.push(Warning {
+                    text: format!("{label} WARM {t}\u{b0}"),
+                    severe: false,
+                });
             }
         }
 
         let disk = self.disk_percent();
         if disk >= 95 {
-            severe.push(Warning { text: format!("DISK {disk}% FULL"), severe: true });
+            severe.push(Warning {
+                text: format!("DISK {disk}% FULL"),
+                severe: true,
+            });
         } else if disk >= 90 {
-            minor.push(Warning { text: format!("DISK {disk}% FULL"), severe: false });
+            minor.push(Warning {
+                text: format!("DISK {disk}% FULL"),
+                severe: false,
+            });
         }
 
         let (used, total) = self.memory_used_total();
-        if total > 0 {
-            let mem = (used * 100 / total) as u8;
-            if mem >= 95 {
-                minor.push(Warning { text: format!("RAM {mem}%"), severe: false });
-            }
+        let mem = (used * 100).checked_div(total).unwrap_or(0) as u8;
+        if mem >= 95 {
+            minor.push(Warning {
+                text: format!("RAM {mem}%"),
+                severe: false,
+            });
         }
 
         severe.extend(minor);
@@ -522,7 +567,10 @@ pub fn fqdn() -> String {
         for line in hosts.lines() {
             let line = line.split('#').next().unwrap_or("");
             for token in line.split_whitespace().skip(1) {
-                if token.strip_prefix(short.as_str()).is_some_and(|rest| rest.starts_with('.')) {
+                if token
+                    .strip_prefix(short.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+                {
                     return token.to_string();
                 }
             }
@@ -555,7 +603,11 @@ mod tests {
         let mem = stats.memory_percent();
         let disk = stats.disk_percent();
         let temp = stats.temperature_celsius();
-        println!("cpu={cpu}% mem={mem}% disk={disk}% temp={temp}C ip={} fqdn={}", ip_address(), fqdn());
+        println!(
+            "cpu={cpu}% mem={mem}% disk={disk}% temp={temp}C ip={} fqdn={}",
+            ip_address(),
+            fqdn()
+        );
         assert!(cpu <= 100);
         assert!((1..=100).contains(&mem));
         assert!(disk <= 100);

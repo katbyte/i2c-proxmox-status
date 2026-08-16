@@ -1,0 +1,13 @@
+[Unit]
+Description=Proxmox stats on the UCTRONICS front-panel LCD
+# The header shows the primary IP, so wait for the network to settle.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/i2c-proxmox-status
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

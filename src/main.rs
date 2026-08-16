@@ -78,6 +78,14 @@ struct Args {
     #[arg(long, default_value_t = 7.0)]
     page_hold: f64,
 
+    /// Drive the rotation from the wall clock instead of free-running:
+    /// restart from the first page at every multiple of this many minutes
+    /// past the hour (10 -> :00, :10, :20 ...), with pages advancing on
+    /// fixed --page-hold slots in between. Panels on several hosts running
+    /// the same page list then show the same page at the same time.
+    #[arg(long, value_name = "MINUTES")]
+    clock_sync: Option<u64>,
+
     /// Horizontal alignment of header text that doesn't fill the display
     #[arg(long, value_enum, default_value = "center")]
     header_align: HeaderAlign,
@@ -146,7 +154,9 @@ fn main() -> ExitCode {
         return run(sim::SimLcd::new(), &args);
         #[cfg(not(feature = "simulator"))]
         {
-            eprintln!("this binary was built without the simulator; rebuild with --features simulator");
+            eprintln!(
+                "this binary was built without the simulator; rebuild with --features simulator"
+            );
             return ExitCode::FAILURE;
         }
     }
@@ -208,10 +218,13 @@ fn run(mut sink: impl PixelSink, args: &Args) -> ExitCode {
 fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
     let mut fb = FrameBuffer::new();
     // The blue divider bar under the header; drawn once, never overdrawn.
-    Rectangle::new(Point::new(0, DIVIDER_Y), Size::new(st7735::WIDTH as u32, DIVIDER_H))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-        .draw(&mut fb)
-        .unwrap();
+    Rectangle::new(
+        Point::new(0, DIVIDER_Y),
+        Size::new(st7735::WIDTH as u32, DIVIDER_H),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+    .draw(&mut fb)
+    .unwrap();
 
     let host = match args.host {
         HostStyle::Fqdn => stats::fqdn(),
@@ -286,8 +299,22 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
 
     let page_refresh = Duration::from_secs_f64(args.page_refresh.max(0.05));
     let page_hold = Duration::from_secs_f64(args.page_hold.max(0.5));
+    // Wall-clock rotation: the page is a pure function of unix time, so
+    // every host running the same page list and holds shows the same page
+    // at the same moment, resetting to page one at each period boundary.
+    let clock_period = args.clock_sync.map(|minutes| minutes.max(1) * 60);
+    let page_count = pages.len();
+    let hold_secs = (args.page_hold.max(0.5).round() as u64).max(1);
+    let clock_slot = move |period: u64| -> usize {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        ((unix % period) / hold_secs) as usize % page_count
+    };
+
     // Start on the first page that wants to show (warnings may be clear).
-    let mut current = 0;
+    let mut current = clock_period.map_or(0, clock_slot);
     for _ in 0..pages.len() {
         if pages[current].active(&mut stats) {
             break;
@@ -303,6 +330,7 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
         let mut deadline = None;
         let mut next_refresh: Option<Instant> = None;
         let mut refresh_deferred = false;
+        let entry_slot = clock_period.map(clock_slot);
         loop {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 return ExitCode::SUCCESS;
@@ -311,7 +339,7 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
             // Page content refreshes at most once per --page-refresh, and a
             // refresh due on the frame the header changed waits one frame,
             // so the header's band flush gets the bus to itself.
-            let refresh_due = next_refresh.map_or(true, |at| Instant::now() >= at);
+            let refresh_due = next_refresh.is_none_or(|at| Instant::now() >= at);
             if refresh_due && (!header_changed || refresh_deferred) {
                 header.set_color(status_color(&mut stats));
                 clear_page_area(&mut fb);
@@ -324,16 +352,27 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
             if let Err(e) = fb.flush(sink) {
                 eprintln!("flush failed: {e}");
             }
-            let deadline = *deadline.get_or_insert_with(|| Instant::now() + page_hold);
-            if Instant::now() >= deadline {
-                break;
+            // Clock-synced rotations move when the wall-clock slot does;
+            // free-running ones hold for --page-hold from full display.
+            if let Some(period) = clock_period {
+                if Some(clock_slot(period)) != entry_slot {
+                    break;
+                }
+            } else {
+                let deadline = *deadline.get_or_insert_with(|| Instant::now() + page_hold);
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
             thread::sleep(FRAME_PAUSE);
         }
 
         // Advance to the next page that wants to show; a page can decline
         // (the warnings page while everything is healthy).
-        let mut next = (current + 1) % pages.len();
+        let mut next = match clock_period {
+            Some(period) => clock_slot(period),
+            None => (current + 1) % pages.len(),
+        };
         while next != current && !pages[next].active(&mut stats) {
             next = (next + 1) % pages.len();
         }
@@ -370,7 +409,10 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
 }
 
 fn page_area() -> Rectangle {
-    Rectangle::new(Point::new(0, PAGE_TOP), Size::new(st7735::WIDTH as u32, PAGE_HEIGHT))
+    Rectangle::new(
+        Point::new(0, PAGE_TOP),
+        Size::new(st7735::WIDTH as u32, PAGE_HEIGHT),
+    )
 }
 
 fn clear_page_area(fb: &mut FrameBuffer) {

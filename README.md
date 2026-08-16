@@ -1,84 +1,135 @@
 # i2c-proxmox-status
 
-A straight Rust conversion of the C display daemon from
-[UCTRONICS/SKU_RM0004](https://github.com/UCTRONICS/SKU_RM0004), the firmware
-companion for the UCTRONICS Pi Rack Pro (19" 1U rack mount for Raspberry Pi,
-SKU RM0004). The original C and Python sources remain in git history.
+[![GitHub release](https://img.shields.io/github/v/release/katbyte/uctronics-rpi-proxmox-display?color=blueviolet)](https://github.com/katbyte/uctronics-rpi-proxmox-display/releases/latest)
+![build](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/build.yaml/badge.svg)
+![test](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/test.yaml/badge.svg)
+![lint](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/lint.yaml/badge.svg)
+[![License](https://img.shields.io/github/license/katbyte/uctronics-rpi-proxmox-display?color=blue)](https://github.com/katbyte/uctronics-rpi-proxmox-display)
 
-## What it does
+Host stats on the front-panel LCD of the UCTRONICS Pi Rack Pro (19" 1U rack
+mount for Raspberry Pi, SKU RM0004). A ground-up Rust rewrite of the C
+display daemon from
+[UCTRONICS/SKU_RM0004](https://github.com/UCTRONICS/SKU_RM0004); the
+original C and Python sources remain in git history.
 
-Rotates the front-panel LCD through a configurable set of pages, one every
-seven seconds, under a header line paging between the IP and the hostname.
-Stats come from the [sysinfo](https://crates.io/crates/sysinfo) crate.
+Rotates the 160x80 panel through btop-style stat pages under a header line
+that pages between the IP and the hostname and doubles as a status light.
+Stats come from the [sysinfo](https://crates.io/crates/sysinfo) crate plus
+direct reads of `/proc`, `/sys`, and `/etc/pve`.
 
-Pages (`--pages`, comma separated, in rotation order):
+## Pages
 
-- `cpus` — btop-style per-core view: a total-CPU history sparkline on top,
-  then a sparkline and current percent per core, every sample colored on
-  btop's green→yellow→red gradient by load. A background thread samples
-  usage continuously so the history keeps moving while other pages show;
-  `--page-history <secs>` sets how much history spans the graphs (default
-  2 minutes, one sample per pixel column)
-- `temps` — CPU/SoC and NVMe temperatures, one row per sensor: the same
-  history sparkline plus a big current reading in the large font, both
-  colored by status (green under 50°C, yellow to 65°C, orange to 75°C, red
-  above). Sensors are matched from the kernel's hwmon labels (cpu_thermal /
-  coretemp / k10temp for the CPU, the NVMe Composite sensor); rows only
-  appear for sensors that exist. Temperatures drift slowly, so this page
-  gets its own, much longer window: `--temp-history <secs>` (default 1 hour)
-- `mem` — memory usage: a full-height history sparkline on the load
-  gradient (`--mem-history` window, default 1 hour), the big current
-  percent, and used over total on two lines
-- `disk` — root filesystem fullness as a bar with the big percent and
-  used/total (no history — the number barely moves), over a disk IOPS
-  sparkline scaled to the window's peak (whole physical disks summed from
-  /proc/diskstats); `--io-history <secs>` sets its window (default 5
-  minutes)
-- `network` — throughput in btop's style: one graph split at a center
-  line, receive climbing up from it and transmit hanging down, each half
-  auto-scaled to its own peak, with labels on the left and the current
-  rates (number over unit) on the right. Physical interfaces only
-  (en*/eth*/wl* — bridges and taps mirror the same packets, so counting
-  them would double everything); `--net-history` sets the window (default
-  and minimum 5 minutes)
-- `warnings` — host problems, one line each: the Pi firmware's throttling
-  flags (under-voltage, frequency capping, throttling, soft temp limit —
-  current ones red, since-boot ones yellow), overheating sensors, disks
-  ≥90% and RAM ≥95%. The page removes itself from the rotation while
-  everything is clear, so seeing it at all means something's wrong
-- `proxmox` — running/defined VM count for the local node (read straight
-  off /etc/pve and the qemu pidfiles, no API or auth needed) with uptime,
-  over a cpus-style load-average history row (scaled as percent of core
-  count, so 1.0 per core pins the graph)
-- `uctronics-cpu`, `uctronics-ram`, `uctronics-temp`, `uctronics-disk` —
-  the single-stat gauge screens carried over from the original C firmware
+Selected and ordered with `--pages` (comma separated). The default rotation
+is `cpus,temps,mem,disk,network,proxmox,warnings`. Screenshots are from the
+simulator at 2x.
 
-The default rotation is `cpus,temps,mem,disk,network,proxmox,warnings`.
-Every page holds for
-`--page-hold` seconds (default 7), counted from when the page is fully on
-the glass. While a page is up,
-its live readings and graphs redraw at most once per `--page-refresh`
-seconds (default 1); a refresh due on the same frame as a header change
-waits one frame, so the header's flush gets the bus to itself.
+### `cpus`
+
+![cpus](docs/screenshots/cpus.png)
+
+btop-style per-core view: a total-CPU history sparkline on top (`C*`), then
+a sparkline and current percent per core, every sample colored on btop's
+green→yellow→red gradient by load. A background thread samples usage
+continuously so the history keeps moving while other pages show;
+`--page-history <secs>` sets how much history spans the graphs (default 2
+minutes, one sample per pixel column).
+
+### `temps`
+
+![temps](docs/screenshots/temps.png)
+
+CPU/SoC and NVMe temperatures, one row per sensor: a history sparkline plus
+a big live reading, both colored by status (green under 50°, yellow to 65°,
+orange to 75°, red above). Sensors are matched from the kernel's hwmon
+labels (cpu_thermal / coretemp / k10temp for the CPU, the NVMe Composite
+sensor); rows only appear for sensors that exist. Temperatures drift
+slowly, so this page gets a much longer window: `--temp-history <secs>`
+(default 1 hour). Simulator builds mock the sensors when the host exposes
+none.
+
+### `mem`
+
+![mem](docs/screenshots/mem.png)
+
+Memory usage: a full-height history sparkline on the load gradient
+(`--mem-history` window, default 1 hour), the big current percent, and used
+over total (dimmed) with a vertical `GB` unit column.
+
+### `disk`
+
+![disk](docs/screenshots/disk.png)
+
+Root filesystem fullness as a bar with a doubled-up percent and used/total
+(no history — the number barely moves), over a disk IOPS sparkline scaled
+to the window's peak (whole physical disks summed from `/proc/diskstats`);
+`--io-history <secs>` sets its window (default 5 minutes).
+
+### `network`
+
+![network](docs/screenshots/network.png)
+
+Throughput in btop's style: one graph split at a center line, receive
+climbing up from it and transmit hanging down, each half auto-scaled to its
+own peak, with vertical `IN`/`OUT` labels and the current rates (number
+over its auto-scaled unit — `B/s`, `kB/s`, `MB/s`). Physical interfaces
+only (`en*`/`eth*`/`wl*` — bridges and taps mirror the same packets, so
+counting them would double everything); `--net-history` sets the window
+(default and minimum 5 minutes).
+
+### `proxmox`
+
+![proxmox](docs/screenshots/proxmox.png)
+
+Running/defined VM count for the local node — read straight off `/etc/pve`
+and the qemu pidfiles, no API or auth needed — with a big uptime, over a
+cpus-style load-average history row (scaled as percent of core count, so
+1.0 per core pins the graph). Shows "not a pve host" off-Proxmox, as above.
+
+### `warnings`
+
+Host problems, one line each: the Pi firmware's throttling flags
+(under-voltage, frequency capping, throttling, soft temp limit — current
+ones red, since-boot ones yellow), overheating sensors (≥75°/85°), disks
+≥90% full, RAM ≥95%. The page removes itself from the rotation while
+everything is clear, so seeing it at all means something's wrong — no
+screenshot because a healthy host never shows it.
+
+### `uctronics-*`
+
+`uctronics-cpu`, `uctronics-ram`, `uctronics-temp`, `uctronics-disk` — the
+single-stat gauge screens carried over from the original C firmware.
+
+## Rotation and timing
+
+Every page holds for `--page-hold` seconds (default 7), counted from when
+the page is fully on the glass. While a page is up, its live readings and
+graphs redraw at most once per `--page-refresh` seconds (default 1); a
+refresh due on the same frame as a header change waits one frame, so the
+header's flush gets the bus to itself.
+
+`--page-mode <cut|wipe-up|wipe-down|wipe-left|wipe-right>` picks the
+transition between pages: `cut` (default) switches instantly; the wipes
+slide the old page out and the next in over a few large steps, since every
+step redraws the whole page area (~450ms each on the real bus).
+
+`--clock-sync <minutes>` drives the rotation from the wall clock instead of
+free-running: the rotation restarts from the first page at every multiple
+of that many minutes past the hour (`10` → :00, :10, :20 …), with pages
+advancing on fixed `--page-hold` slots in between. Panels on several hosts
+running the same page list then show the same page at the same moment.
 
 On exit the daemon leaves a full-screen message on the panel (the bridge
 MCU keeps showing the last frame after the process stops): `--close-text`
 (default `CLOSED`, white) on a clean exit via ctrl-c/SIGTERM, and
 `--crash-text` (default `CRASH`, red) if the daemon panics.
 
-Page content is treated as static while shown — the diff flush means an
-unchanged page costs nothing on the slow bus. `--page-mode
-<cut|wipe-up|wipe-down|wipe-left|wipe-right>` picks the transition between
-pages: `cut` (default) switches instantly; the wipes slide the old page out
-and the next in over a few large steps, since every step redraws the whole
-page area (~450ms each on the real bus).
+## The header
 
-The header text doubles as a status light: white while the host is
+The `ip - hostname` line is drawn on the glass before anything else at
+startup, and its text doubles as a status light: white while the host is
 healthy, then yellow / orange / red as the hottest temperature sensor
-(65/75/85°C) or root filesystem fullness (80/90/95%) escalates. Active Pi
+(65/75/85°) or root filesystem fullness (80/90/95%) escalates. Active Pi
 throttling flags go straight to red; since-boot flags show yellow.
-
-Header behavior is configurable:
 
 - `--host <hostname|fqdn>` — short hostname (default) or the FQDN
 - `--header-mode <cut|slide|wipe-up|wipe-down|wipe-left|wipe-right>` — the
@@ -96,8 +147,70 @@ Header behavior is configurable:
   rotation changes (once `--header-hold` has elapsed), so with matching
   wipe modes the header and page slide in step
 
-The end goal is to show Proxmox host stats pulled from the Proxmox API
-instead of local readings; that part isn't built yet.
+## Install
+
+Needs Rust 1.85+ (`apt install cargo` on Debian 13 is enough) and I2C
+enabled on the Pi — in `/boot/firmware/config.txt` (or `/boot/config.txt`
+on older OS releases):
+
+```
+dtparam=i2c_arm=on,i2c_arm_baudrate=400000
+```
+
+Then, on the Pi:
+
+```bash
+sudo make install
+```
+
+which release-builds the daemon, installs it to `/usr/local/bin`, installs
+the systemd unit from `packaging/`, and enables + starts it — it runs at
+boot from then on. `sudo make uninstall` reverses all of it. To run it by
+hand instead:
+
+```bash
+cargo build --release
+sudo ./target/release/i2c-proxmox-status   # sudo unless your user is in the i2c group
+```
+
+Dependencies are vendored: all crate sources live in `vendor/` and
+`.cargo/config.toml` points builds at it, so no network access is needed.
+After changing anything in `Cargo.toml`, refresh it with `cargo vendor`.
+
+## Development
+
+### Simulator
+
+Preview the display on a desktop without the hardware:
+
+```bash
+make sim    # = cargo run --features simulator -- --simulator; needs SDL2 (brew install sdl2 / apt install libsdl2-dev)
+```
+
+The cargo feature controls whether SDL2 is linked at all (so the Pi build
+never needs it); the `--simulator`/`-s` flag selects it at runtime.
+
+Opens a 4x-scaled window driven by the exact same compose/flush path as the
+real panel. Blits sleep through a timing model of the I2C bus (wire time,
+chunk pauses, session command overhead), so the marquee cadence and
+screen-switch hitches match what the rack shows — design against the
+simulator, then just rebuild on the Pi. The model is a close approximation
+of measured hardware behavior, not a cycle-exact emulation.
+
+With `SIM_SNAPSHOT_DIR=<dir>` set, the simulator also saves a PNG of the
+panel once a second (`frame_0000.png`, …) — handy for reviewing layouts
+(it's how the screenshots above were made). Simulator builds mock the
+temperature sensors when the host has none, so the temps page shows data.
+
+### Lint and test
+
+```bash
+make lint   # rustfmt --check + clippy with warnings as errors (what CI enforces)
+make test
+make fmt    # reformat
+```
+
+CI (GitHub Actions) runs build, test, and lint on every push and PR.
 
 ## How the display works
 
@@ -126,7 +239,7 @@ value per pixel into it, left-to-right, top-to-bottom. The register numbers
 `0x2A`/`0x2B`/`0x2C` mirror the real ST7735 CASET/RASET/RAMWR commands the
 MCU issues on the other side.
 
-Two quirks the driver has to honor:
+Quirks the driver has to honor:
 
 - **Panel offset** — the 160x80 module is a windowed slice of the ST7735's
   native 162x132 RAM, mounted rotated. In this orientation every Y
@@ -151,71 +264,39 @@ in-memory framebuffer (`src/framebuffer.rs`), which implements
 [embedded-graphics](https://crates.io/crates/embedded-graphics)'
 `DrawTarget`, so text, rectangles, and the rest of its primitives all render
 into RAM for free. `flush()` then diffs the frame against a copy of what the
-display currently shows and pushes only the changed rows (contiguous dirty
-rows as one full-width burst blit each — the bridge MCU misbehaves with
-narrow windows at arbitrary offsets, so bands are never column-trimmed).
+display currently shows and pushes only the changed rows, top to bottom
+(contiguous dirty rows as one full-width burst blit each — the bridge MCU
+misbehaves with narrow windows at arbitrary offsets, so bands are never
+column-trimmed).
 
 Fonts come from embedded-graphics' built-in monospace set (9x15 for the
-header, 10x20 for the values) — the bitmap fonts hand-ported from the C repo
-are gone.
+header, 10x20 for the big values, 6x10 for the rest), with a pixel-doubling
+helper for anything that needs to be larger.
 
-### Pages
+### Pages internally
 
-`src/screens.rs` implements the header and the pages. When `ip - hostname`
-is wider than the display the header animates per `--header-mode`: the
-slide marquee advances 1px per frame, while the wipe modes page through
-display-width chunks of the text. Each `Page` renders into the 160x55 area
-under the divider through a clipped+translated draw target, so pages draw
-in local coordinates from (0,0) and the same render code works mid-wipe at
-an offset. Main clears the page area and re-renders the current page every
-frame; the diff flush works out what actually needs to hit the bus. The gauge is ten 6x10 segments at the bottom, filled proportionally to
-the percentage in a per-screen color (green/yellow/red/blue), gray for the
-remainder.
-
-## Build and run
-
-Needs Rust 1.85+ (`apt install cargo` on Debian 13 is enough) and I2C
-enabled on the Pi — in `/boot/firmware/config.txt` (or `/boot/config.txt` on
-older OS releases):
-
-```
-dtparam=i2c_arm=on,i2c_arm_baudrate=400000
-```
-
-Then:
-
-```bash
-cargo build --release
-sudo ./target/release/i2c-proxmox-status   # sudo unless your user is in the i2c group
-```
-
-Dependencies are vendored: all crate sources live in `vendor/` and
-`.cargo/config.toml` points builds at it, so no network access is needed.
-After changing anything in `Cargo.toml`, refresh it with `cargo vendor`.
-
-## Simulator
-
-Preview the display on a desktop without the hardware:
-
-```bash
-cargo run --features simulator -- --simulator   # or -s; needs SDL2 (brew install sdl2 / apt install libsdl2-dev)
-```
-
-The cargo feature controls whether SDL2 is linked at all (so the Pi build
-never needs it); the `--simulator`/`-s` flag selects it at runtime.
-
-Opens a 4x-scaled window driven by the exact same compose/flush path as the
-real panel. Blits sleep through a timing model of the I2C bus (wire time,
-chunk pauses, session command overhead), so the marquee cadence and
-screen-switch hitches match what the rack shows — design against the
-simulator, then just rebuild on the Pi. The model is a close approximation
-of measured hardware behavior, not a cycle-exact emulation.
+`src/screens.rs` implements the header and the pages. Each `Page` renders
+into the 160x61 area under the divider through a clipped+translated draw
+target, so pages draw in local coordinates from (0,0) and the same render
+code works mid-wipe at an offset. Main clears the page area and re-renders
+the current page on each refresh tick; the diff flush works out what
+actually needs to hit the bus. A `Page` can also decline to be shown
+(`active()`), which is how the warnings page stays out of the rotation on a
+healthy host. Stat history lives in a background sampler thread with one
+sampling interval per series — `window seconds / graph columns`, so one
+sample lands per pixel column and every graph spans exactly its configured
+window.
 
 ## Layout
 
 - `src/st7735.rs` — display transport (the bridge's I2C register protocol)
 - `src/sim.rs` — SDL simulator transport with an I2C timing model (`--features simulator`)
 - `src/framebuffer.rs` — embedded-graphics `DrawTarget` + differential flush
-- `src/stats.rs` — stat collection (sysinfo crate), the stat history sampler thread, Proxmox guest counts, IP/hostname helpers
+- `src/stats.rs` — stat collection (sysinfo crate), the per-series history sampler thread, Proxmox guest counts, throttling flags, warnings, IP/hostname helpers
 - `src/screens.rs` — header animations, `Page` trait, the pages
-- `src/main.rs` — the compose/flush loop
+- `src/main.rs` — the compose/flush loop and rotation
+- `packaging/` — the systemd unit `make install` deploys
+- `docs/screenshots/` — simulator captures used above
+
+The end goal is to also show cluster-wide stats pulled from the Proxmox
+API instead of only local readings; that part isn't built yet.
