@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sysinfo::{Components, Disks, MemoryRefreshKind, Networks, System};
+use sysinfo::{Components, MemoryRefreshKind, Networks, System};
 
 /// More samples than any graph has columns (the panel is 160px wide);
 /// pages render the newest `width` samples of a series, so the span a graph
@@ -306,7 +306,6 @@ fn push_capped_u32(samples: &mut VecDeque<u32>, value: u32) {
 pub struct Stats {
     system: System,
     components: Components,
-    disks: Disks,
 }
 
 impl Stats {
@@ -317,7 +316,6 @@ impl Stats {
         Self {
             system,
             components: Components::new_with_refreshed_list(),
-            disks: Disks::new_with_refreshed_list(),
         }
     }
 
@@ -375,18 +373,19 @@ impl Stats {
         (used * 100 / total) as u8
     }
 
-    /// Used and total space on the root filesystem, in bytes.
+    /// Used and total space on the root filesystem, in bytes — straight
+    /// from statvfs("/"), which works on any mounted root (LVM-thin and
+    /// ZFS roots don't reliably appear in sysinfo's disk enumeration).
     pub fn disk_used_total(&mut self) -> (u64, u64) {
-        self.disks.refresh(true);
-        let Some(root) = self
-            .disks
-            .iter()
-            .find(|d| d.mount_point() == Path::new("/"))
-        else {
+        let path = std::ffi::CString::new("/").unwrap();
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
             return (0, 0);
-        };
-        let total = root.total_space();
-        (total - root.available_space(), total)
+        }
+        let frsize = stat.f_frsize as u64;
+        let total = stat.f_blocks as u64 * frsize;
+        let free = stat.f_bfree as u64 * frsize;
+        (total.saturating_sub(free), total)
     }
 }
 
