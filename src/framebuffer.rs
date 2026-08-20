@@ -74,6 +74,16 @@ impl FrameBuffer {
         Ok(())
     }
 
+    /// Forget what's on the glass, forcing the next flush to resend the
+    /// whole frame — self-repair in case the bridge ever dropped or
+    /// displaced rows (the content is identical, so nothing visibly
+    /// changes unless something was actually wrong).
+    pub fn invalidate(&mut self) {
+        for pixel in &mut self.shown {
+            *pixel ^= 0xFFFF;
+        }
+    }
+
     fn row_dirty(&self, y: usize) -> bool {
         self.back[y * W..(y + 1) * W] != self.shown[y * W..(y + 1) * W]
     }

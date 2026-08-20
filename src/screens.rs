@@ -58,8 +58,12 @@ pub enum PageKind {
     Temps,
     /// Memory usage: history sparkline + big current percent
     Mem,
-    /// Root filesystem usage plus a disk IOPS sparkline
-    Disk,
+    /// Root and VM storage usage plus a disk IOPS sparkline
+    #[value(alias = "disk")]
+    Disks,
+    /// The previous disk page: one root-fs bar with a big percent, over
+    /// the IOPS sparkline
+    DisksSingleBar,
     /// Network in/out rate sparklines with current rates
     Network,
     /// Host problems (throttling, heat, full disk); hidden while clear
@@ -694,6 +698,23 @@ fn draw_vertical_label(fb: &mut PageTarget<'_, '_>, text: &str, font: &MonoFont)
     }
 }
 
+/// Bytes as a short size with its own unit: "573G", "7.6G", "3.4T".
+fn format_size(bytes: u64) -> String {
+    let gib = bytes as f64 / (1u64 << 30) as f64;
+    if gib >= 1000.0 {
+        let tib = gib / 1024.0;
+        if tib < 10.0 {
+            format!("{tib:.1}T")
+        } else {
+            format!("{tib:.0}T")
+        }
+    } else if gib < 10.0 {
+        format!("{gib:.1}G")
+    } else {
+        format!("{gib:.0}G")
+    }
+}
+
 /// Bytes as gibibytes sized for the panel: "7.6" under ten, "16" above.
 fn format_gib(bytes: u64) -> String {
     let gib = bytes as f64 / (1u64 << 30) as f64;
@@ -916,6 +937,102 @@ impl DiskPage {
 
 impl Page for DiskPage {
     fn render(&mut self, fb: &mut PageTarget<'_, '_>, stats: &mut Stats) {
+        let history = self.sampler.snapshot();
+        draw_vertical_label(fb, "DISK", &FONT_9X15);
+
+        // One line per filesystem: root always, then the Proxmox VM
+        // storage under its own (capitalized) storage name when the
+        // sampler found one.
+        let small = MonoTextStyle::new(CPUS_FONT, Rgb565::WHITE);
+        let root = stats.disk_used_total();
+        let mut rows = vec![("ROOT".to_string(), root.0, root.1)];
+        if let Some((name, used, total)) = history.vm_storage.clone() {
+            let mut label = name.to_uppercase();
+            label.truncate(8);
+            rows.push((label, used, total));
+        }
+        // One shared value column, set by the widest label, so the used
+        // figures line up across rows.
+        let value_x = 11
+            + rows
+                .iter()
+                .map(|(label, _, _)| text_width(CPUS_FONT, label))
+                .max()
+                .unwrap_or(0)
+            + 6;
+        for (i, (label, used, total)) in rows.into_iter().enumerate() {
+            // 15px rows: the used figure and percent get the 9x15 font;
+            // the label and the dimmed "/total" stay small.
+            let row_y = i as i32 * 15;
+            let y = row_y + 3;
+            Text::with_baseline(&label, Point::new(11, y), small, Baseline::Top)
+                .draw(fb)
+                .unwrap();
+            let used_text = format_size(used);
+            let big = MonoTextStyle::new(&FONT_9X15, Rgb565::WHITE);
+            Text::with_baseline(&used_text, Point::new(value_x, row_y), big, Baseline::Top)
+                .draw(fb)
+                .unwrap();
+            let total_text = format!("/{}", format_size(total));
+            let dim = MonoTextStyle::new(CPUS_FONT, Rgb565::new(20, 40, 20));
+            let total_x = value_x + text_width(&FONT_9X15, &used_text);
+            Text::with_baseline(&total_text, Point::new(total_x, y + 2), dim, Baseline::Top)
+                .draw(fb)
+                .unwrap();
+            let percent = (used * 100).checked_div(total).unwrap_or(0) as u8;
+            let color = match percent {
+                0..=79 => Rgb565::GREEN,
+                80..=89 => Rgb565::YELLOW,
+                _ => Rgb565::RED,
+            };
+            let text = format!("{percent}%");
+            let x = WIDTH as i32 - text_width(&FONT_9X15, &text);
+            let style = MonoTextStyle::new(&FONT_9X15, color);
+            Text::with_baseline(&text, Point::new(x, row_y), style, Baseline::Top)
+                .draw(fb)
+                .unwrap();
+        }
+
+        draw_sparkline_scaled(
+            fb,
+            &history.iops,
+            IO_GRAPH_X,
+            32,
+            IO_GRAPH_WIDTH,
+            26,
+            50,
+            IO_COLOR,
+        );
+        let current = history.iops.back().copied().unwrap_or(0);
+        let text = format_count(current);
+        let x = WIDTH as i32 - text_width(CPUS_FONT, &text);
+        let style = MonoTextStyle::new(CPUS_FONT, IO_COLOR);
+        Text::with_baseline(&text, Point::new(x, 41), style, Baseline::Top)
+            .draw(fb)
+            .unwrap();
+        let x = WIDTH as i32 - text_width(CPUS_FONT, "iops");
+        let unit_style = MonoTextStyle::new(CPUS_FONT, GRAY);
+        Text::with_baseline("iops", Point::new(x, 51), unit_style, Baseline::Top)
+            .draw(fb)
+            .unwrap();
+    }
+}
+
+/// The previous disk page look, kept as `disks-single-bar`: root
+/// filesystem fullness as a bar with a doubled-up percent, over the same
+/// IOPS sparkline. No VM storage row.
+pub struct DiskBarPage {
+    sampler: Sampler,
+}
+
+impl DiskBarPage {
+    pub fn new(sampler: Sampler) -> Self {
+        Self { sampler }
+    }
+}
+
+impl Page for DiskBarPage {
+    fn render(&mut self, fb: &mut PageTarget<'_, '_>, stats: &mut Stats) {
         let (used, total) = stats.disk_used_total();
         let percent = (used * 100).checked_div(total).unwrap_or(0) as u8;
         let fill_color = match percent {
@@ -969,7 +1086,6 @@ impl Page for DiskPage {
             .draw(fb)
             .unwrap();
         let x = WIDTH as i32 - text_width(CPUS_FONT, "iops");
-        let unit_style = MonoTextStyle::new(CPUS_FONT, GRAY);
         Text::with_baseline("iops", Point::new(x, 51), unit_style, Baseline::Top)
             .draw(fb)
             .unwrap();

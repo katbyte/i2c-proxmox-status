@@ -34,6 +34,9 @@ pub struct History {
     /// Network receive/transmit rates in bytes per second.
     pub net_rx: VecDeque<u32>,
     pub net_tx: VecDeque<u32>,
+    /// The node's main VM storage: (name, used bytes, total bytes),
+    /// None off-Proxmox.
+    pub vm_storage: Option<(String, u64, u64)>,
 }
 
 /// One tracked temperature sensor; only sensors present at startup get a
@@ -103,6 +106,7 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
             &mut history.mem,
             (system.used_memory() * 100).checked_div(total).unwrap_or(0) as u8,
         );
+        history.vm_storage = proxmox_vm_storage();
     }
 
     let now = Instant::now();
@@ -111,6 +115,9 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
     let mut next_mem = now + cfg.mem;
     let mut next_io = now + cfg.io;
     let mut next_net = now + cfg.net;
+    // VM storage moves slowly and pvesh spawns a process, so poll it gently.
+    const PVESH_INTERVAL: Duration = Duration::from_secs(60);
+    let mut next_pvesh = now + PVESH_INTERVAL;
     // Advance a deadline by its interval, resyncing if sampling fell behind.
     let bump = |deadline: &mut Instant, interval: Duration| {
         *deadline += interval;
@@ -124,7 +131,8 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
             .min(next_temp)
             .min(next_mem)
             .min(next_io)
-            .min(next_net);
+            .min(next_net)
+            .min(next_pvesh);
         thread::sleep(next.saturating_duration_since(Instant::now()));
         let now = Instant::now();
 
@@ -190,7 +198,232 @@ fn sample_loop(cfg: SamplerConfig, sink: Arc<Mutex<History>>) {
             drop(history);
             bump(&mut next_net, cfg.net);
         }
+        if now >= next_pvesh {
+            let storage = proxmox_vm_storage();
+            sink.lock().unwrap().vm_storage = storage;
+            bump(&mut next_pvesh, PVESH_INTERVAL);
+        }
     }
+}
+
+/// Used/total bytes summed over the node's VM-disk storages, via
+/// `pvesh get /nodes/<node>/storage` — Proxmox's own numbers, which cover
+/// LVM-thin pools and ZFS datasets that no mounted filesystem exposes.
+/// None when pvesh is missing or fails (not a Proxmox host).
+fn proxmox_vm_storage() -> Option<(String, u64, u64)> {
+    pvesh_vm_storage().or_else(storage_cfg_vm_storage)
+}
+
+/// VM storage usage via pvesh. Fails (with a log line) where pvesh can't
+/// reach pmxcfs over IPC — seen on Pimox — in which case the storage.cfg
+/// fallback below takes over.
+fn pvesh_vm_storage() -> Option<(String, u64, u64)> {
+    let node = hostname();
+    let out = match std::process::Command::new("pvesh")
+        .args([
+            "get",
+            &format!("/nodes/{node}/storage"),
+            "--output-format",
+            "json",
+        ])
+        .output()
+    {
+        Ok(out) => out,
+        // Missing binary just means not a Proxmox host — stay quiet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("pvesh spawn failed: {e}");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        eprintln!(
+            "pvesh get /nodes/{node}/storage failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    let json = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut candidates: Vec<(String, u64, u64)> = Vec::new();
+    // The objects are flat, so splitting on '{' yields one chunk each.
+    for obj in json.split('{').skip(1) {
+        // Only enabled, active storages holding VM images on this node's
+        // own disks: shared storage (cifs/nfs/pbs) isn't this node's
+        // capacity, and dir storages sit on a filesystem the ROOT row
+        // already shows — hence the whitelist of local block types.
+        if !json_str(obj, "content").is_some_and(|c| c.contains("images")) {
+            continue;
+        }
+        let stype = json_str(obj, "type").unwrap_or("");
+        if !matches!(stype, "lvmthin" | "lvm" | "zfspool" | "zfs" | "btrfs") {
+            continue;
+        }
+        if json_u64(obj, "active") == Some(0)
+            || json_u64(obj, "enabled") == Some(0)
+            || json_u64(obj, "shared") == Some(1)
+        {
+            continue;
+        }
+        let name = json_str(obj, "storage").unwrap_or("vm").to_string();
+        let used = json_u64(obj, "used").unwrap_or(0);
+        let total = json_u64(obj, "total").unwrap_or(0);
+        if total > 0 {
+            candidates.push((name, used, total));
+        }
+    }
+    // Only one row fits under ROOT, so show the largest storage.
+    let best = candidates.into_iter().max_by_key(|(_, _, total)| *total);
+    if best.is_none() {
+        eprintln!("pvesh listed no local block storage with images content");
+    }
+    best
+}
+
+/// Fallback when pvesh is broken: read /etc/pve/storage.cfg (a plain file
+/// on the pmxcfs mount) for storages holding VM images, then ask each
+/// backend for its usage directly.
+fn storage_cfg_vm_storage() -> Option<(String, u64, u64)> {
+    let cfg = fs::read_to_string("/etc/pve/storage.cfg").ok()?;
+    let sections = storage_cfg_sections(&cfg);
+    let mut candidates: Vec<(String, u64, u64)> = Vec::new();
+    for (stype, name, props) in &sections {
+        let get = |key: &str| {
+            props
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        if !get("content").is_some_and(|c| c.contains("images")) {
+            continue;
+        }
+        if get("disable").is_some_and(|d| d != "0") {
+            continue;
+        }
+        // Same policy as the pvesh path: this node's own disks only.
+        if get("shared").is_some_and(|v| v != "0") {
+            continue;
+        }
+        let figures = match stype.as_str() {
+            "lvmthin" => match (get("vgname"), get("thinpool")) {
+                (Some(vg), Some(pool)) => lvmthin_used_total(vg, pool),
+                _ => None,
+            },
+            "zfspool" => get("pool").and_then(zfs_used_total),
+            "lvm" => get("vgname").and_then(vg_used_total),
+            _ => None,
+        };
+        if let Some((used, total)) = figures {
+            if total > 0 {
+                candidates.push((name.clone(), used, total));
+            }
+        }
+    }
+    candidates.into_iter().max_by_key(|(_, _, total)| *total)
+}
+
+/// storage.cfg sections as (type, name, properties): sections start
+/// unindented as "type: name"; properties are indented "key value" lines.
+type CfgSection = (String, String, Vec<(String, String)>);
+fn storage_cfg_sections(cfg: &str) -> Vec<CfgSection> {
+    let mut sections: Vec<CfgSection> = Vec::new();
+    for line in cfg.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with([' ', '\t']) {
+            if let Some((stype, name)) = line.split_once(':') {
+                sections.push((
+                    stype.trim().to_string(),
+                    name.trim().to_string(),
+                    Vec::new(),
+                ));
+            }
+        } else if let Some((_, _, props)) = sections.last_mut() {
+            let mut parts = line.trim().splitn(2, char::is_whitespace);
+            if let Some(key) = parts.next() {
+                let value = parts.next().unwrap_or("").trim().to_string();
+                props.push((key.to_string(), value));
+            }
+        }
+    }
+    sections
+}
+
+/// Stdout of a successfully-exited command, or None.
+fn run(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Used/total of an LVM thin pool: its size and data_percent from lvs.
+fn lvmthin_used_total(vg: &str, pool: &str) -> Option<(u64, u64)> {
+    let target = format!("{vg}/{pool}");
+    let out = run(
+        "lvs",
+        &[
+            "--noheadings",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "lv_size,data_percent",
+            &target,
+        ],
+    )?;
+    let mut fields = out.split_whitespace();
+    let size: u64 = fields.next()?.parse().ok()?;
+    let percent: f64 = fields.next()?.parse().ok()?;
+    Some(((size as f64 * percent / 100.0) as u64, size))
+}
+
+/// Used/total of a ZFS dataset (used + avail = capacity available to it).
+fn zfs_used_total(pool: &str) -> Option<(u64, u64)> {
+    let out = run("zfs", &["list", "-Hp", "-o", "used,avail", pool])?;
+    let mut fields = out.split_whitespace();
+    let used: u64 = fields.next()?.parse().ok()?;
+    let avail: u64 = fields.next()?.parse().ok()?;
+    Some((used, used + avail))
+}
+
+/// Used/total of a fat LVM volume group, from vgs.
+fn vg_used_total(vg: &str) -> Option<(u64, u64)> {
+    let out = run(
+        "vgs",
+        &[
+            "--noheadings",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "vg_size,vg_free",
+            vg,
+        ],
+    )?;
+    let mut fields = out.split_whitespace();
+    let size: u64 = fields.next()?.parse().ok()?;
+    let free: u64 = fields.next()?.parse().ok()?;
+    Some((size.saturating_sub(free), size))
+}
+
+/// The string value of `"key":"..."` in a flat JSON object, if present.
+fn json_str<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\":\"");
+    let start = obj.find(&pattern)? + pattern.len();
+    let rest = &obj[start..];
+    Some(&rest[..rest.find('"')?])
+}
+
+/// The integer value of `"key":123` in a flat JSON object, if present.
+fn json_u64(obj: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{key}\":");
+    let start = obj.find(&pattern)? + pattern.len();
+    // pvesh sometimes quotes numeric flags ("1"); skip a leading quote.
+    let rest = obj[start..].trim_start().trim_start_matches('"');
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// Cumulative received/transmitted bytes summed over physical interfaces
@@ -377,16 +610,21 @@ impl Stats {
     /// from statvfs("/"), which works on any mounted root (LVM-thin and
     /// ZFS roots don't reliably appear in sysinfo's disk enumeration).
     pub fn disk_used_total(&mut self) -> (u64, u64) {
-        let path = std::ffi::CString::new("/").unwrap();
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
-            return (0, 0);
-        }
-        let frsize = stat.f_frsize as u64;
-        let total = stat.f_blocks as u64 * frsize;
-        let free = stat.f_bfree as u64 * frsize;
-        (total.saturating_sub(free), total)
+        statvfs_used_total("/").unwrap_or((0, 0))
     }
+}
+
+/// statvfs-based used/total bytes of the filesystem holding `path`.
+fn statvfs_used_total(path: &str) -> Option<(u64, u64)> {
+    let cpath = std::ffi::CString::new(path).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let frsize = stat.f_frsize as u64;
+    let total = stat.f_blocks as u64 * frsize;
+    let free = stat.f_bfree as u64 * frsize;
+    Some((total.saturating_sub(free), total))
 }
 
 /// Running/defined guest counts read straight off the Proxmox host's
@@ -593,6 +831,26 @@ pub fn ip_address() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_cfg_parse() {
+        let cfg = "dir: local\n\tpath /var/lib/vz\n\tcontent iso,vztmpl\n\nlvmthin: local-lvm\n\tthinpool data\n\tvgname pve\n\tcontent rootdir,images\n";
+        let sections = storage_cfg_sections(cfg);
+        assert_eq!(sections.len(), 2);
+        let (stype, name, props) = &sections[1];
+        assert_eq!(stype, "lvmthin");
+        assert_eq!(name, "local-lvm");
+        let get = |key: &str| {
+            props
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("vgname"), Some("pve"));
+        assert_eq!(get("thinpool"), Some("data"));
+        assert!(get("content").unwrap().contains("images"));
+        assert_eq!(sections[0].0, "dir");
+    }
 
     #[test]
     fn stats_smoke() {

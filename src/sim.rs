@@ -104,11 +104,12 @@ fn bus_time(w: u16, h: u16) -> Duration {
 
     let bytes = 2.0 * w as f64 * h as f64;
     let chunks = (bytes / 160.0).ceil();
-    let session_rows = (16 * 160 / (2 * w as usize)).max(1);
+    let session_rows = (8 * 160 / (2 * w as usize)).max(1);
     let sessions = (h as f64 / session_rows as f64).ceil();
+    const SESSION_SETTLE: f64 = 12e-3; // post-sync + window settles
 
     let secs = bytes * BYTE
         + chunks * (BYTE + CHUNK_PAUSE) // chunk address byte + pause
-        + sessions * COMMANDS_PER_SESSION * COMMAND;
+        + sessions * (COMMANDS_PER_SESSION * COMMAND + SESSION_SETTLE);
     Duration::from_secs_f64(secs)
 }

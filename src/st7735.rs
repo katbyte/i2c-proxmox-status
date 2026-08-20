@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const WIDTH: u16 = 160;
 pub const HEIGHT: u16 = 80;
@@ -33,9 +33,17 @@ const BURST_WRITE_REG: u8 = 0x01;
 const SYNC_REG: u8 = 0x03;
 
 const BURST_MAX_LENGTH: usize = 160;
+// Pause after each sync while the MCU pushes the session to the glass.
+const SYNC_SETTLE: Duration = Duration::from_millis(10);
+// Settle after a window-setup sync (much less MCU work than a burst).
+const WINDOW_SETTLE: Duration = Duration::from_millis(2);
+// A bus idle longer than this gets a wake-up nudge before real commands:
+// the first transactions after a quiet spell have been seen to vanish.
+const IDLE_WAKE: Duration = Duration::from_millis(500);
 
 pub struct Lcd {
     i2c: File,
+    last_write: Instant,
 }
 
 impl Lcd {
@@ -46,11 +54,15 @@ impl Lcd {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { i2c })
+        Ok(Self {
+            i2c,
+            last_write: Instant::now(),
+        })
     }
 
     fn write_command(&mut self, command: u8, high: u8, low: u8) -> io::Result<()> {
         self.i2c.write_all(&[command, high, low])?;
+        self.last_write = Instant::now();
         thread::sleep(Duration::from_micros(10));
         Ok(())
     }
@@ -64,14 +76,22 @@ impl Lcd {
             thread::sleep(Duration::from_micros(700));
         }
         self.write_command(BURST_WRITE_REG, 0x00, 0x00)?;
-        self.write_command(SYNC_REG, 0x00, 0x01)
+        self.write_command(SYNC_REG, 0x00, 0x01)?;
+        // After a sync the MCU flushes the session to the panel over SPI,
+        // which takes a few ms; commands sent while it's busy are silently
+        // dropped — the next session's address window doesn't take and its
+        // rows land displaced. Give it time to finish.
+        thread::sleep(SYNC_SETTLE);
+        Ok(())
     }
 
     fn set_address_window(&mut self, x0: u8, y0: u8, x1: u8, y1: u8) -> io::Result<()> {
         self.write_command(X_COORDINATE_REG, x0 + X_START, x1 + X_START)?;
         self.write_command(Y_COORDINATE_REG, y0 + Y_START, y1 + Y_START)?;
         self.write_command(CHAR_DATA_REG, 0x00, 0x00)?;
-        self.write_command(SYNC_REG, 0x00, 0x01)
+        self.write_command(SYNC_REG, 0x00, 0x01)?;
+        thread::sleep(WINDOW_SETTLE);
+        Ok(())
     }
 }
 
@@ -83,7 +103,17 @@ impl crate::framebuffer::PixelSink for Lcd {
     /// on the panel. 16 full-width rows is the largest session verified on
     /// real hardware.
     fn blit(&mut self, x: u16, y: u16, w: u16, h: u16, pixels: &[u16]) -> io::Result<()> {
-        const MAX_SESSION_BYTES: usize = 16 * 160 * 2;
+        // 8 full-width rows per session: half the verified 16-row maximum,
+        // keeping each post-sync MCU flush short. The first rows of tall
+        // blits were still occasionally lost at 16.
+        const MAX_SESSION_BYTES: usize = 8 * 160 * 2;
+
+        // After a quiet stretch the bridge has been seen to drop the first
+        // transactions; nudge it with a harmless sync and let it settle.
+        if self.last_write.elapsed() > IDLE_WAKE {
+            self.write_command(SYNC_REG, 0x00, 0x01)?;
+            thread::sleep(SYNC_SETTLE);
+        }
 
         let pixels = &pixels[..w as usize * h as usize];
         let session_rows = (MAX_SESSION_BYTES / (2 * w as usize)).max(1) as u16;

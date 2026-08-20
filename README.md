@@ -22,7 +22,7 @@ same page at the same moment — with nothing but their clocks.
 ## Pages
 
 Selected and ordered with `--pages` (comma separated). The default rotation
-is `cpus,temps,mem,disk,network,proxmox,warnings`. Screenshots are from the
+is `cpus,temps,mem,disks,network,proxmox,warnings`. Screenshots are from the
 simulator at 2x.
 
 ### `cpus`
@@ -57,14 +57,30 @@ Memory usage: a full-height history sparkline on the load gradient
 (`--mem-history` window, default 1 hour), the big current percent, and used
 over total (dimmed) with a vertical `GB` unit column.
 
-### `disk`
+### `disks`
 
 ![disk](docs/screenshots/disk.png)
 
-Root filesystem fullness as a bar with a doubled-up percent and used/total
-(no history — the number barely moves), over a disk IOPS sparkline scaled
-to the window's peak (whole physical disks summed from `/proc/diskstats`);
-`--io-history <secs>` sets its window (default 5 minutes).
+One line per filesystem — `ROOT` (via `statvfs("/")`, so LVM and ZFS
+roots work) and, on a Proxmox host, `VM`: the node's own VM-image
+storage — local block-backed types only (lvmthin / lvm / zfspool / btrfs);
+shared storages (cifs/nfs/pbs) aren't this node's disk and dir storages
+already sit on a filesystem the `ROOT` row shows, so both are excluded —
+polled once a minute from `pvesh get /nodes/<node>/storage`, falling back
+to reading `/etc/pve/storage.cfg` and querying each backend directly
+(`lvs` for thin pools, `zfs list` for ZFS, `vgs` for fat LVM, statvfs for
+dir storages) where pvesh's IPC is broken, as on Pimox. Each line shows
+used/total and a percent colored by fullness. Below, a disk IOPS
+sparkline scaled to the window's peak (whole physical disks summed from
+`/proc/diskstats`); `--io-history <secs>` sets its window (default 5
+minutes). The screenshot is from a non-Proxmox host, so only `ROOT`
+shows.
+
+### `disks-single-bar`
+
+The previous disk-page look, kept for anyone who prefers it (not in the
+default rotation): a single root-filesystem bar with a doubled-up percent,
+over the same IOPS sparkline. No VM storage row.
 
 ### `network`
 
@@ -119,6 +135,11 @@ free-running: the rotation restarts from the first page at every multiple
 of that many minutes past the hour (`10` → :00, :10, :20 …), with pages
 advancing on fixed `--page-hold` slots in between. Panels on several hosts
 running the same page list then show the same page at the same moment.
+
+Every `--repaint` seconds (default 60, `0` disables) the next page change
+resends the entire frame instead of just the diff — self-repair in case
+the display bridge ever dropped or displaced rows, invisible when nothing
+was wrong.
 
 On exit the daemon leaves a full-screen message on the panel (the bridge
 MCU keeps showing the last frame after the process stops): `--close-text`
@@ -305,8 +326,7 @@ misbehaves with narrow windows at arbitrary offsets, so bands are never
 column-trimmed).
 
 Fonts come from embedded-graphics' built-in monospace set (9x15 for the
-header, 10x20 for the big values, 6x10 for the rest), with a pixel-doubling
-helper for anything that needs to be larger.
+header, 10x20 for the big values, 6x10 for the rest).
 
 ### Pages internally
 

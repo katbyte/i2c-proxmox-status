@@ -30,10 +30,10 @@ use embedded_graphics::text::{Baseline, Text};
 
 use framebuffer::{FrameBuffer, PixelSink};
 use screens::{
-    status_color, text_width, CpuScreen, CpusPage, DiskPage, DiskScreen, Header, HeaderAlign,
-    HeaderMode, MemPage, NetPage, Page, PageKind, PageMode, ProxmoxPage, RamScreen, TempScreen,
-    TempsPage, WarningsPage, DIVIDER_H, DIVIDER_Y, GRAPH_WIDTH, IO_GRAPH_WIDTH, MEM_GRAPH_WIDTH,
-    NET_GRAPH_WIDTH, PAGE_HEIGHT, PAGE_TOP, TEMP_GRAPH_WIDTH,
+    status_color, text_width, CpuScreen, CpusPage, DiskBarPage, DiskPage, DiskScreen, Header,
+    HeaderAlign, HeaderMode, MemPage, NetPage, Page, PageKind, PageMode, ProxmoxPage, RamScreen,
+    TempScreen, TempsPage, WarningsPage, DIVIDER_H, DIVIDER_Y, GRAPH_WIDTH, IO_GRAPH_WIDTH,
+    MEM_GRAPH_WIDTH, NET_GRAPH_WIDTH, PAGE_HEIGHT, PAGE_TOP, TEMP_GRAPH_WIDTH,
 };
 
 // Breather between frames; the marquee flush itself (~140ms on the bus) sets
@@ -78,6 +78,12 @@ struct Args {
     #[arg(long, default_value_t = 7.0)]
     page_hold: f64,
 
+    /// Seconds between full-frame repaints, timed to a page change (a
+    /// self-repair against rows the display bridge may have dropped;
+    /// 0 disables)
+    #[arg(long, default_value_t = 60)]
+    repaint: u64,
+
     /// Drive the rotation from the wall clock instead of free-running:
     /// restart from the first page at every multiple of this many minutes
     /// past the hour (10 -> :00, :10, :20 ...), with pages advancing on
@@ -99,7 +105,7 @@ struct Args {
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "cpus,temps,mem,disk,network,proxmox,warnings"
+        default_value = "cpus,temps,mem,disks,network,proxmox,warnings"
     )]
     pages: Vec<PageKind>,
 
@@ -259,7 +265,8 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
             PageKind::Cpus
                 | PageKind::Temps
                 | PageKind::Mem
-                | PageKind::Disk
+                | PageKind::Disks
+                | PageKind::DisksSingleBar
                 | PageKind::Network
                 | PageKind::Proxmox
         )
@@ -285,7 +292,8 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
                 PageKind::Cpus => Box::new(CpusPage::new(sampler.clone().unwrap())),
                 PageKind::Temps => Box::new(TempsPage::new(sampler.clone().unwrap())),
                 PageKind::Mem => Box::new(MemPage::new(sampler.clone().unwrap())),
-                PageKind::Disk => Box::new(DiskPage::new(sampler.clone().unwrap())),
+                PageKind::Disks => Box::new(DiskPage::new(sampler.clone().unwrap())),
+                PageKind::DisksSingleBar => Box::new(DiskBarPage::new(sampler.clone().unwrap())),
                 PageKind::Network => Box::new(NetPage::new(sampler.clone().unwrap())),
                 PageKind::Warnings => Box::new(WarningsPage),
                 PageKind::Proxmox => Box::new(ProxmoxPage::new(sampler.clone().unwrap())),
@@ -313,6 +321,7 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
         ((unix % period) / hold_secs) as usize % page_count
     };
 
+    let mut last_repaint = Instant::now();
     // Start on the first page that wants to show (warnings may be clear).
     let mut current = clock_period.map_or(0, clock_slot);
     for _ in 0..pages.len() {
@@ -365,6 +374,13 @@ fn main_loop(sink: &mut impl PixelSink, args: &Args) -> ExitCode {
                 }
             }
             thread::sleep(FRAME_PAUSE);
+        }
+
+        // A page change repaints most of the glass anyway, so it's the
+        // cheap moment to occasionally resend everything.
+        if args.repaint > 0 && last_repaint.elapsed() >= Duration::from_secs(args.repaint) {
+            fb.invalidate();
+            last_repaint = Instant::now();
         }
 
         // Advance to the next page that wants to show; a page can decline
