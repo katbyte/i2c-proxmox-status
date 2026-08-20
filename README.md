@@ -1,10 +1,10 @@
 # i2c-proxmox-status
 
-[![GitHub release](https://img.shields.io/github/v/release/katbyte/uctronics-rpi-proxmox-display?color=blueviolet)](https://github.com/katbyte/uctronics-rpi-proxmox-display/releases/latest)
-![build](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/build.yaml/badge.svg)
-![test](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/test.yaml/badge.svg)
-![lint](https://github.com/katbyte/uctronics-rpi-proxmox-display/actions/workflows/lint.yaml/badge.svg)
-[![License](https://img.shields.io/github/license/katbyte/uctronics-rpi-proxmox-display?color=blue)](https://github.com/katbyte/uctronics-rpi-proxmox-display/blob/main/LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/katbyte/i2c-proxmox-status?color=blueviolet)](https://github.com/katbyte/i2c-proxmox-status/releases/latest)
+![build](https://github.com/katbyte/i2c-proxmox-status/actions/workflows/build.yaml/badge.svg)
+![test](https://github.com/katbyte/i2c-proxmox-status/actions/workflows/test.yaml/badge.svg)
+![lint](https://github.com/katbyte/i2c-proxmox-status/actions/workflows/lint.yaml/badge.svg)
+[![License](https://img.shields.io/github/license/katbyte/i2c-proxmox-status?color=blue)](https://github.com/katbyte/i2c-proxmox-status/blob/main/LICENSE)
 
 Host stats on the front-panel LCD of the UCTRONICS Pi Rack Pro (19" 1U rack
 mount for Raspberry Pi, SKU RM0004). A ground-up Rust rewrite of the C
@@ -23,7 +23,7 @@ same page at the same moment — with nothing but their clocks.
 
 Selected and ordered with `--pages` (comma separated). The default rotation
 is `cpus,temps,mem,disks,network,proxmox,warnings`. Screenshots are from the
-simulator at 2x.
+simulator at 4x.
 
 ### `cpus`
 
@@ -301,11 +301,17 @@ Quirks the driver has to honor:
   native 162x132 RAM, mounted rotated. In this orientation every Y
   coordinate is offset by 24 rows (`Y_START` in `src/st7735.rs`).
 - **Pacing** — the MCU needs breathing room: ~10µs after each 3-byte
-  transaction, and burst writes chunked to 160 bytes with ~700µs between
-  chunks.
+  transaction, burst writes chunked to 160 bytes with ~700µs between
+  chunks, and ~10ms after each sync while it flushes the session to the
+  glass — commands sent during that flush are silently dropped, which
+  displaces the rows that follow.
 - **Session size** — a single burst session longer than ~5KB (16 full-width
-  rows) overruns the bridge and the content lands displaced on the panel,
-  so tall blits are split into 16-row windows.
+  rows) overruns the bridge and the content lands displaced on the panel.
+  Tall blits are split into 8-row windows — half that verified maximum,
+  since the first rows of a session were still occasionally lost at 16.
+- **Wake-up** — after ~500ms of bus idle the first transactions of the next
+  batch have been seen to vanish, so a quiet spell ends with a harmless
+  sync as a nudge (plus its settle) before any real commands.
 
 Single-pixel writes (register `0x00`) cost one I2C transaction per pixel,
 so this daemon never uses them: everything goes through burst mode — enable
@@ -314,7 +320,8 @@ register `0x01`, stream raw pixel bytes in 160-byte chunks, disable, sync.
 ### Framebuffer and differential flushing
 
 The I2C bus is the bottleneck: ~40 KB/s at 400kHz means a full-screen push
-(25.6 KB) takes ~0.8s, and a 160x16 header band ~140ms — about 7fps at best.
+(25.6 KB) takes ~0.9s with the pacing pauses, and a 160x16 header band
+~170ms — about 6fps at best.
 So nothing draws to the display directly. Each frame is composed into an
 in-memory framebuffer (`src/framebuffer.rs`), which implements
 [embedded-graphics](https://crates.io/crates/embedded-graphics)'
@@ -347,7 +354,7 @@ window.
 - `src/st7735.rs` — display transport (the bridge's I2C register protocol)
 - `src/sim.rs` — SDL simulator transport with an I2C timing model (`--features simulator`)
 - `src/framebuffer.rs` — embedded-graphics `DrawTarget` + differential flush
-- `src/stats.rs` — stat collection (sysinfo crate), the per-series history sampler thread, Proxmox guest counts, throttling flags, warnings, IP/hostname helpers
+- `src/stats.rs` — stat collection (sysinfo crate), the per-series history sampler thread, Proxmox guest counts and VM storage, throttling flags, warnings, IP/hostname helpers
 - `src/screens.rs` — header animations, `Page` trait, the pages
 - `src/main.rs` — the compose/flush loop and rotation
 - `packaging/` — the systemd unit `make install` deploys
